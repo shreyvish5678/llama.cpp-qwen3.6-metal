@@ -68,6 +68,24 @@
 #define N_R0_Q5_K_R1 2
 #define N_R0_Q6_K_R1 2
 
+// src0 rows per simdgroup for the Q6_K multi-column mat-vec on WIDE matrices at verify widths of
+// 3 and 4. The multi-column kernels are bound by activation-read traffic, which is
+// (ne01/nr0)*nr1*ne00*4 bytes of requests - widths 2-4 all sit on one ~2.3 TB/s ceiling while
+// width 1 sits under it, DRAM-bound on the weights. nr0 is the only knob that divides that, and
+// Q6_K is the one K-quant with the register headroom to raise it: it reads its int8 sub-block
+// scales inline, where q4_K and q5_K hoist 8*nr0 of them across the super-block.
+//
+// This value is used in TWO places that must agree - the dispatch sizes the grid from it and the
+// kernel unrolls its row loop from it - so it is a named constant rather than a literal in each.
+#define N_R0_Q6_K_R1_WIDE 4
+
+// Minimum ne01 for N_R0_Q6_K_R1_WIDE. The real constraint is threadgroups against GPU cores:
+// nr0 = 4 leaves ne01/(nr0*nsg) threadgroups, and on this 32-core part 4096 rows is 512 of them,
+// 16 per core. Below that the wider tile loses - a 1024-row matrix drops to 128 threadgroups and
+// costs 1.5x. Expressed as a row count because that is what the dispatch has to hand; on a part
+// with a very different core count this threshold should be re-derived, not inherited.
+#define N_R0_Q6_K_R1_WIDE_MIN_NE01 4096
+
 #define N_R0_IQ1_S 4
 #define N_SG_IQ1_S 2
 

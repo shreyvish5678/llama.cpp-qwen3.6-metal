@@ -9172,6 +9172,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
 
+    // Wide-matrix coverage for the multi-column K-quant mat-vec.
+    //
+    // Without these, NOTHING in this suite exercises a K-quant mat-vec above ne01 = 16, so any
+    // backend that switches kernels on a large row count is untested and a pass/fail here says
+    // nothing about it. Metal's Q6_K path takes a wider tile at ne01 >= 4096 and nr1 >= 3; the
+    // cases below straddle that boundary in both dimensions.
+    //
+    // ne01 is deliberately not all round numbers: 4100 is the partial-tile case, where
+    // first_row + row runs off the end of the matrix and the store guard has to hold.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int m : {4088, 4095, 4096, 4100, 5120}) {
+            for (int n : {1, 2, 3, 4, 8}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 1024, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4, 8}) {

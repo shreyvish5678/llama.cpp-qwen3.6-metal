@@ -934,9 +934,28 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
                 const int nr1k = ggml_metal_mul_mv_nr1_k(ne11);
                 if (nr1k > 1) {
-                    nr0    = N_R0_Q6_K_R1;
+                    // A5-q6nr0. Measured on this model's real Q6_K tensors, both order halves:
+                    //   ffn_down  k=17408 m=5120    width 3 0.74x   width 4 0.58x
+                    //   attn_qkv  k=5120  m=10240   width 3 0.74x   width 4 0.63x
+                    //   output    k=5120  m=248320  width 3 0.73x   width 4 0.71x
+                    // Gated on width because at nr1 = 2 it is 1.01-1.06x: the extra rows only pay
+                    // once the activation stream is the binding constraint. Gated on rows because
+                    // nr0 = 4 leaves ne01/(nr0*nsg) threadgroups, and a 1024-row matrix drops to
+                    // 128 across 32 cores, where it loses 1.5x. Bit-exact either way - each
+                    // simdgroup still computes whole rows and reduces with simd_sum inside itself.
+                    // read once: this runs for every Q6_K MUL_MAT on every graph encode
+                    static const bool off = getenv("GGML_METAL_NO_Q6_NR0") != nullptr;
+
+                    const bool wide = nr1k >= 3 && ne01 >= N_R0_Q6_K_R1_WIDE_MIN_NE01 && !off;
+
+                    nr0    = wide ? N_R0_Q6_K_R1_WIDE : N_R0_Q6_K_R1;
                     nr1    = nr1k;
-                    suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                    if (wide) {
+                        suffix = nr1k == 3 ? "_r1_3_r0_4" : "_r1_4_r0_4";
+                    } else {
+                        suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                    }
+                    static_assert(N_R0_Q6_K_R1_WIDE == 4, "the _r0_4 suffixes above are literal");
                 }
             } break;
         case GGML_TYPE_IQ2_XXS:

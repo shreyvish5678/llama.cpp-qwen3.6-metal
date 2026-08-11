@@ -9184,6 +9184,34 @@ MUL_MV_NR1_KERNEL(q6_K, N_R0_Q6_K_R1, 2)
 MUL_MV_NR1_KERNEL(q6_K, N_R0_Q6_K_R1, 3)
 MUL_MV_NR1_KERNEL(q6_K, N_R0_Q6_K_R1, 4)
 
+// A5-q6nr0: nr0 = 4 instantiations of the Q6_K multi-column mat-vec, selected at dispatch for
+// verify widths of 3 and 4 on large matrices. The multi-column kernels are bound by activation
+// READ traffic - (ne01/nr0)*nr1*ne00*4 bytes of requests - not by the weight stream: widths 2-4
+// all sit on one ~2.3 TB/s request ceiling while width 1 sits under it, DRAM-bound. nr0 is the
+// only knob that divides that traffic, and Q6_K is the one K-quant that can take it, because it
+// reads its int8 sub-block scales inline where q4_K and q5_K hoist 8*nr0 registers across the
+// super-block.
+#define MUL_MV_NR1_KERNEL_R0(type, NR0, NR1) \
+    [[host_name("kernel_mul_mv_" #type "_f32_r1_" #NR1 "_r0_" #NR0)]] \
+    kernel void kernel_mul_mv_##type##_f32_r1_##NR1##_r0_##NR0( \
+            constant ggml_metal_kargs_mul_mv & args, \
+            device const char * src0, \
+            device const char * src1, \
+            device       char * dst, \
+            uint3  tgpig[[threadgroup_position_in_grid]], \
+            ushort tiisg[[thread_index_in_simdgroup]], \
+            ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+        kernel_mul_mv_##type##_f32_nr1_impl<NR0, NR1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg); \
+    }
+
+// one level of indirection so NR0 is EXPANDED before it is stringified into the host_name.
+// Passing N_R0_Q6_K_R1_WIDE straight to MUL_MV_NR1_KERNEL_R0 would name the kernel
+// "..._r0_N_R0_Q6_K_R1_WIDE" and the dispatch would never find it.
+#define MUL_MV_NR1_KERNEL_R0_X(type, NR0, NR1) MUL_MV_NR1_KERNEL_R0(type, NR0, NR1)
+
+MUL_MV_NR1_KERNEL_R0_X(q6_K, N_R0_Q6_K_R1_WIDE, 3)
+MUL_MV_NR1_KERNEL_R0_X(q6_K, N_R0_Q6_K_R1_WIDE, 4)
+
 // ======================= "True" 2-bit
 
 template<int nr0, typename args_t>
