@@ -910,9 +910,36 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
                 const int nr1k = ggml_metal_mul_mv_nr1_k(ne11);
                 if (nr1k > 1) {
-                    nr0    = N_R0_Q4_K_R1;
-                    nr1    = nr1k;
-                    suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                    // A10-q4l16. Sixteen lanes per super-block instead of eight, AND four rows per
+                    // simdgroup instead of two. Neither alone is a win - nr0 = 4 on the 8-lane
+                    // mapping is 0.98x, and 16 lanes at nr0 = 2 is 1.083x - because the 8-lane
+                    // mapping reads one float4 per lane at a stride of 8 floats, so it uses half of
+                    // every 128-byte line and halving the requested bytes does not reduce the line
+                    // transactions. Sixteen contiguous lanes cover a full line, and then the wider
+                    // tile has something to spend itself on.
+                    //
+                    // Measured, real decode shapes, order-balanced, control drift 0.998:
+                    //   width 2  1.137   <- gated out
+                    //   width 3  0.859   (0.857-0.862 over four shapes)
+                    //   width 4  0.847
+                    // Gated on ne01 for the same reason as A5: nr0*nsg = 8 rows per threadgroup
+                    // leaves a 1024-row matrix with 128 threadgroups across 32 cores.
+                    //
+                    // NOT bit-exact - the products are the same but the partition into per-lane
+                    // partial sums changes, so the simd_sum tree changes. Greedy output was
+                    // byte-identical over the 10-prompt set; test-backend-ops MUL_MAT is a
+                    // tolerance check and does not settle this on its own.
+                    static const bool l16_off = getenv("GGML_METAL_NO_Q4_L16") != nullptr;
+
+                    const bool l16 = nr1k >= 3 && ne01 >= 4096 && !l16_off;
+
+                    nr0 = l16 ? 4 : N_R0_Q4_K_R1;
+                    nr1 = nr1k;
+                    if (l16) {
+                        suffix = nr1k == 3 ? "_r1_3_l16_4" : "_r1_4_l16_4";
+                    } else {
+                        suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                    }
                 }
             } break;
         case GGML_TYPE_Q5_K:

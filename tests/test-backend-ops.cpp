@@ -9172,6 +9172,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
 
+    // A5 / A10 gate boundary. The K-quant multi-column mat-vec kernels change tile width at
+    // ne01 >= 4096, and every other K-quant mat-vec case in this suite is m = 16 - so a pass/fail
+    // taken with one of those gates set proves nothing, because both arms run identical code.
+    // These straddle the threshold and, at m = 4100, exercise the partial tile where
+    // first_row + row runs past the end of the matrix at nr0*nsg = 8 rows per threadgroup.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int m : {4088, 4095, 4096, 4100, 4104}) {
+            for (int n : {2, 3, 4}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // Wide-matrix coverage for the multi-column K-quant mat-vec.
     //
     // Without these, NOTHING in this suite exercises a K-quant mat-vec above ne01 = 16, so any

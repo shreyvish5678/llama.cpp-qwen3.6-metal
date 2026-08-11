@@ -8680,6 +8680,169 @@ MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 2)
 MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 3)
 MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 4)
 
+// A8-lanes16: the q4_K multi-column mat-vec with SIXTEEN lanes on a super-block instead of eight.
+//
+// This is the last structural difference between the q4_K and q6_K multi-column kernels that has
+// not been tested, and q6_K is the one that takes the wider tile. q4_K uses ix = tiisg/8 - four
+// super-blocks in flight per simdgroup, eight lanes each, eight sub-groups of four elements per
+// lane. q6_K uses two super-blocks and sixteen lanes. Everything else about the two kernels has
+// now been equalised or ruled out by measurement: weight-stream locality, threadgroup count,
+// hoisted scale registers, activation traffic, and accumulator shape.
+//
+// Same work, redistributed. Per super-block a lane now covers four float4s instead of eight, and
+// the eight sub-group calls collapse to four because ir spans 0..7 rather than 0..3, so the
+// YOFF = 0 / YOFF = 4 pair is no longer needed:
+//
+//   lane tid in [0,16):  iq = tid/8   ir = tid%8
+//   y element base    :  64*iq + 4*ir           (was 64*iq + 8*ir, with YOFF adding 0 or 4)
+//   qs uint index     :  8*iq + ir + QI,  QI in {0, 16}   (was 8*iq + 2*ir + QI, QI in {0,1,16,17})
+//
+// Verified against the old mapping by hand at the corners: (iq=0,ir=0) covers e 0-3 from uint 0
+// low, e 32-35 from uint 0 high, e 128-131 from uint 16 low, e 160-163 from uint 16 high;
+// (iq=0,ir=7) covers e 28-31 from uint 7, which the old scheme reached as ir=3, YOFF=4, QI=1.
+// Total uints touched per super-block is 32 either way.
+//
+// ix = tiisg/16 keeps SIXTEEN CONTIGUOUS LANES on one super-block. q6_K interleaves instead
+// (ix = tiisg%2), which spreads one load instruction across two super-blocks 1 KB apart; that is
+// the worse of the two for coalescing, so it is not copied. The variable under test is
+// lanes-per-super-block, not the interleave.
+#define MV_L16_Q4_K_SG(YOFF, QI, SH, SI)                                         \
+    {                                                                            \
+        MV_NR1_LOAD_YG(YOFF)                                                     \
+                                                                                 \
+        device const uint * qp = qb + (QI);                                      \
+                                                                                 \
+        FOR_UNROLL (short row = 0; row < nr0; ++row) {                           \
+            const float4 f = unpack_unorm4x8_to_float((qp[0] >> (SH)) & 0x0F0F0F0F); \
+            const float4 w = ds[row][SI]*f - dm[row][SI];                        \
+                                                                                 \
+            FOR_UNROLL (short c = 0; c < nr1; ++c) {                             \
+                sumf[row][c] += dot(w, yg[c]);                                   \
+            }                                                                    \
+                                                                                 \
+            qp += sr4;                                                           \
+        }                                                                        \
+    }
+
+template<int nr0, int nr1, typename args_t>
+void kernel_mul_mv_q4_K_f32_nr1_l16_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const short ix  = tiisg/16;   // 0 or 1  -> two super-blocks in flight
+    const short tid = tiisg%16;   // 0..15   -> sixteen lanes on each
+    const short iq  = tid/8;      // 0 or 1
+    const short ir  = tid%8;      // 0..7
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y*nr1;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);
+
+    const short ncols = (short) min((int) nr1, args.ne1 - r1);
+
+    device const float * yb = (device const float *) (src1 + offset1) + 64*iq + 4*ir;
+
+    const int ys = (int) (args.nb11/sizeof(float));
+
+    int yc[nr1];
+
+    FOR_UNROLL (short c = 0; c < nr1; ++c) {
+        yc[c] = (c < ncols ? c : 0)*ys;
+    }
+
+    const uint64_t sr2 = args.nb01/2;
+    const uint64_t sr4 = args.nb01/4;
+
+    float sumf[nr0][nr1];
+
+    FOR_UNROLL (short row = 0; row < nr0; ++row) {
+        FOR_UNROLL (short c = 0; c < nr1; ++c) {
+            sumf[row][c] = 0.f;
+        }
+    }
+
+    float4 yg[nr1];
+
+    float ds[nr0][4];
+    float dm[nr0][4];
+
+    for (int ib = ix; ib < nb; ib += 2) {
+        {
+            device const uint16_t * sp = (device const uint16_t *)x[ib].scales + iq;
+            device const half     * dp = &x[ib].d;
+
+            FOR_UNROLL (short row = 0; row < nr0; ++row) {
+                const ushort s0 = sp[0];
+                const ushort s2 = sp[2];
+                const ushort s4 = sp[4];
+
+                const ushort sa = s0 & 0x3f3f;
+                const ushort sb = s2 & 0x3f3f;
+                const ushort sc = ((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2);
+                const ushort sd = ((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2);
+
+                const float dv = 255.f*(float) dp[0];
+                const float mv =        (float) dp[1];
+
+                ds[row][0] = dv*(sa & 0xFF); dm[row][0] = mv*(sb & 0xFF);
+                ds[row][1] = dv*(sa >>   8); dm[row][1] = mv*(sb >>   8);
+                ds[row][2] = dv*(sc & 0xFF); dm[row][2] = mv*(sd & 0xFF);
+                ds[row][3] = dv*(sc >>   8); dm[row][3] = mv*(sd >>   8);
+
+                sp += sr2;
+                dp += sr2;
+            }
+        }
+
+        device const uint * qb = (device const uint *)x[ib].qs + 8*iq + ir;
+
+        const int yi = ib*QK_K;
+
+        MV_L16_Q4_K_SG(  0,  0, 0, 0)
+        MV_L16_Q4_K_SG( 32,  0, 4, 1)
+        MV_L16_Q4_K_SG(128, 16, 0, 2)
+        MV_L16_Q4_K_SG(160, 16, 4, 3)
+    }
+
+    MV_NR1_STORE()
+}
+
+#define MUL_MV_NR1_L16_KERNEL(NR0, NR1) \
+    [[host_name("kernel_mul_mv_q4_K_f32_r1_" #NR1 "_l16_" #NR0)]] \
+    kernel void kernel_mul_mv_q4_K_f32_r1_##NR1##_l16_##NR0( \
+            constant ggml_metal_kargs_mul_mv & args, \
+            device const char * src0, \
+            device const char * src1, \
+            device       char * dst, \
+            uint3  tgpig[[threadgroup_position_in_grid]], \
+            ushort tiisg[[thread_index_in_simdgroup]], \
+            ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+        kernel_mul_mv_q4_K_f32_nr1_l16_impl<NR0, NR1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg); \
+    }
+
+MUL_MV_NR1_L16_KERNEL(4, 2)
+MUL_MV_NR1_L16_KERNEL(4, 3)
+MUL_MV_NR1_L16_KERNEL(4, 4)
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_q5_K_f32_impl(
         args_t args,
