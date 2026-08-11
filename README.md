@@ -1,3 +1,9 @@
+> **This is a fork.** It carries Metal-backend tuning for Qwen3.6-27B on an Apple M4 Max —
+> ~+37 % decode against MLX with speculative decoding on, and a `test-backend-ops` coverage gap
+> worth upstreaming. What changed, what it measures, and what is still unexplained about it:
+> **[QWEN36-METAL.md](QWEN36-METAL.md)**. Branch `shipped` is the tuned stack; `master` is the
+> upstream commit it forks from.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
