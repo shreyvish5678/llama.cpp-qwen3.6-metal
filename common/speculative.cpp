@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>    // Z-adaedl: logf/sqrtf
+#include <cstdlib>  // Z-adaedl: getenv/atof
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -1246,6 +1248,114 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// Z-adaedl: entropy-based early stopping for the draft loop (AdaEDL).
+//
+// The shipped gate stops drafting when the draft's TOP-1 PROBABILITY falls below params.p_min.
+// Top-1 probability is a poor predictor of whether the target will accept the token: it is blind
+// to the shape of the rest of the distribution. Two positions can both have p_top1 = 0.55 while
+// one has all remaining mass on a single alternative and the other has it spread over hundreds.
+//
+// AdaEDL instead bounds the acceptance probability from below using the entropy of the draft
+// distribution. Via Pinsker's inequality the acceptance rate of a drafted token is at least
+// 1 - sqrt(H(q)/2), with H in nats. Stop when that bound drops below tau.
+//
+// This is a DRAFT-LENGTH POLICY ONLY. It never touches verification, so in exact arithmetic the
+// emitted text is unchanged no matter what it decides. The caveat is real but indirect: changing
+// when drafting stops changes the distribution of VERIFY WIDTHS, and this backend's kernels are
+// not bit-identical across widths (measurement-hazards section 6 -- mat-vec at 1-3, mul_mv_ext at
+// 4-8, mul_mm above 8). So it must still go through the losslessness run.
+//
+// Entropy is computed over the WHOLE candidate array, not a top-K prefix. Truncating is tempting
+// and wrong: checked numerically before this ever ran, a 0.99/uniform-tail distribution over a
+// 65,536-entry vocabulary has true entropy 0.164 nats (bound 0.714), but the top-64 prefix carries
+// almost all the mass and reports 0.009 nats (bound 0.991). The tail is negligible in *mass* and
+// dominant in *entropy*, because entropy weights by log(1/p) and the tail's log(1/p) is ~15.7.
+// Truncating would have systematically overestimated confidence and over-drafted. The full loop is
+// ~65k flops per draft step, ~0.15 % of an 87.8 ms cycle at depth 2.
+//
+// NOTE on tau: the Pinsker bound is loose, so tau is NOT on the same scale as p_min. Computed over
+// a 65,536 vocabulary, top-1 = 0.90 scores 0.311 and top-1 = 0.80 scores 0.205. **Sweep tau in
+// {0.15, 0.25, 0.35}.** tau >= 0.45 stops drafting on everything short of near-certainty and is a
+// wasted arm; tau near p_min's 0.6 never drafts at all.
+//
+// The point is not that AdaEDL drafts more or less -- it REALLOCATES. The two cases where it
+// disagrees with p_min = 0.6, both computed exactly:
+//
+//   top-1 = 0.50 with the runner-up at 0.49   p_min STOPS,  AdaEDL drafts (bound 0.347)
+//       mass is concentrated in two tokens, so acceptance is ~0.5 and a draft is worth trying
+//   top-1 = 0.65 with the rest spread flat    p_min DRAFTS, AdaEDL stops  (bound -0.505)
+//       the tail is fat (H = 4.53 nats), so the draft is probably wasted
+//
+// That is the whole mechanism: top-1 probability cannot see the shape of the tail, and entropy can.
+//
+//   GGML_SPEC_ADAEDL_TAU   unset or <= 0  -> shipped p_min gate (default, byte-identical)
+//                          > 0            -> entropy gate at this tau
+// tau is read from a FILE, not only the environment, so that a tau sweep can be interleaved inside
+// ONE warm server. An env var is read once per process, which forces a restart per arm; a restart
+// puts ~12 minutes and a 17 GB model reload between the two measurements of the same prompt, and
+// this machine drifts ~12 %/hour under load (measurement-hazards sections 2 and 3). The file is
+// re-read at most every 50 ms, so the cost is one stat per draft step at worst.
+//
+// GGML_SPEC_ADAEDL_TAU_FILE  path to a file holding a single float; missing or unparseable -> env
+// GGML_SPEC_ADAEDL_TAU       fallback, read once
+// neither set / value <= 0   -> shipped p_min gate, byte-identical to shipped
+static float common_spec_adaedl_tau() {
+    static const float tau_env = getenv("GGML_SPEC_ADAEDL_TAU") ? (float) atof(getenv("GGML_SPEC_ADAEDL_TAU")) : 0.0f;
+    static const char * path   = getenv("GGML_SPEC_ADAEDL_TAU_FILE");
+
+    if (!path) {
+        return tau_env;
+    }
+
+    static int64_t last_us = 0;
+    static float   tau     = tau_env;
+
+    const int64_t now_us = ggml_time_us();
+
+    if (now_us - last_us >= 50000) {
+        last_us = now_us;
+
+        FILE * f = fopen(path, "r");
+        if (f) {
+            float v = 0.0f;
+            if (fscanf(f, "%f", &v) == 1) {
+                tau = v;
+            }
+            fclose(f);
+        }
+    }
+
+    return tau;
+}
+
+// returns the AdaEDL lower bound on acceptance probability for this draft distribution
+static float common_spec_accept_lower_bound(const llama_token_data_array * cur_p) {
+    const int n = (int) cur_p->size;
+
+    if (n <= 0) {
+        return 0.0f;
+    }
+
+    float sum = 0.0f;
+    for (int k = 0; k < n; ++k) {
+        sum += cur_p->data[k].p;
+    }
+
+    if (!(sum > 0.0f)) {
+        return 0.0f;
+    }
+
+    float h = 0.0f; // Shannon entropy in nats, over the renormalised top-K
+    for (int k = 0; k < n; ++k) {
+        const float p = cur_p->data[k].p / sum;
+        if (p > 0.0f) {
+            h -= p * logf(p);
+        }
+    }
+
+    return 1.0f - sqrtf(0.5f*h);
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1600,8 +1710,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                // only collect very high-confidence draft tokens.
+                // Z-adaedl: tau > 0 swaps the top-1-probability gate for the entropy-based
+                //           acceptance lower bound. Default 0 -> shipped behaviour, unchanged.
+                const float adaedl_tau = common_spec_adaedl_tau();
+
+                const bool stop_drafting = adaedl_tau > 0.0f
+                    ? common_spec_accept_lower_bound(cur_p) < adaedl_tau
+                    : cur_p->data[0].p < params.p_min;
+
+                if (stop_drafting) {
                     drafting[seq_id] = false;
                     n_drafting--;
 

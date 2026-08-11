@@ -10065,6 +10065,59 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // L1-runlen: iso-traffic sweep of per-threadgroup CONTIGUOUS RUN LENGTH.
+    //
+    // All three shapes have m*k = 58,720,256, so weight bytes are identical (33.03 MB at Q4_K) and
+    // the activation bytes requested are identical too ((m/nr0)*k*4 = 469 MB). Same type, same
+    // width, same registers. The ONLY thing that moves is how many contiguous bytes one
+    // threadgroup streams before it jumps a row stride, and it moves 16x:
+    //
+    //     m=4096  k=14336   56 superblocks/row  -> nr0(2) * 56 * 144 B = 16.1 KB per threadgroup
+    //     m=16384 k=3584    14 superblocks/row  ->                        4.03 KB
+    //     m=1024  k=57344  224 superblocks/row  ->                       64.5 KB
+    //
+    // Threadgroup COUNT moves the other way (4096/1024/256 at nr0*nsg=4), which is the confound.
+    // Separate the two with GGML_METAL_MV_NSG, which halves the grid at identical nr0, identical
+    // registers and an identical per-simdgroup stream.
+    //
+    // If GB/s is flat within 3% across a 16x run-length swing, the streaming-locality story is
+    // wrong and the whole K-quant weight-repack line closes. k is a multiple of 256 in all three.
+    // widths 1..4 because the MTP verify pass runs at ne11 = depth+1, and the whole question the
+    // sweep exists to answer is why identical weight traffic costs 2.26x more at width 4 than at 1.
+    for (int bs : {1, 2, 3, 4}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  4096, bs, 14336, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16384, bs,  3584, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  1024, bs, 57344, {1, 1}, {1, 1}));
+        }
+    }
+
+    // A2-r1nr0: the real qwen3.6-27b decode shapes, read out of the GGUF header rather than
+    // reconstructed from prose. ggml stores src0 as [ne00, ne01] = [k, m], and the first version of
+    // this block had ffn_down and ffn_gate the wrong way round - it measured both transposes and
+    // neither tensor. m is what the nr0 sweep divides, so getting it backwards changes the answer.
+    //
+    //   Q6_K   ffn_down   k=17408 m=5120     every layer
+    //          attn_qkv   k=5120  m=10240
+    //          output     k=5120  m=248320   read every token
+    //          attn_v     k=5120  m=1024
+    //   Q4_K   ffn_gate   k=5120  m=17408    x2 with ffn_up
+    //          attn_q     k=5120  m=12288
+    //          attn_gate  k=5120  m=6144
+    //          attn_out   k=6144  m=5120
+    //   Q5_K   ssm_out    k=6144  m=5120
+    for (int bs : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,   5120, bs, 17408, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  10240, bs,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, bs,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,   1024, bs,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  17408, bs,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  12288, bs,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   6144, bs,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   5120, bs,  6144, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,   5120, bs,  6144, {1, 1}, {1, 1}));
+    }
+
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {

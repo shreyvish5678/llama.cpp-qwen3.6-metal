@@ -539,6 +539,35 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(ggml_me
     return res;
 }
 
+// W-ssmconv: channel-parallel variant for the decode path (ne1 == 1). Same body as the plain
+// kernel; only the grid mapping differs, so the pipeline lookup is the plain one with a _ch tag.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_ch(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(ggml_is_contiguous(op->src[0]));
+    GGML_ASSERT(ggml_is_contiguous(op->src[1]));
+
+    char base[256];
+    char name[256];
+
+    const char * suffix = "";
+
+    if (op->src[1]->ne[0] % 4 == 0) {
+        suffix = "_4";
+    }
+
+    snprintf(base, 256, "kernel_ssm_conv_%s_%s_ch%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), suffix);
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched(ggml_metal_library_t lib, const ggml_tensor * op, int ssm_conv_bs) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
@@ -798,6 +827,119 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+// A2-r1nr0: diagnostic override of rows-per-simdgroup for the multi-column K-quant mat-vec.
+// 0 (default) = use the shipped N_R0_*_R1 and the un-suffixed kernel names, so an unset binary
+// dispatches byte-identical work. 1/2/4 select the _r0_N instantiations. Bit-exact across values:
+// each simdgroup still computes whole rows and reduces with simd_sum inside one simdgroup.
+// Both overrides can also come from a FILE holding "<lz> <nr0>", re-read at most every 50 ms.
+// An env var is read once per process, so an A/B of these knobs would need a server restart per
+// arm -- ~12 minutes and a 17 GB reload between the two measurements of the same prompt, on a
+// machine that drifts ~12 %/hour under load. The pipeline getter runs per node per graph encode,
+// so a value changed between requests takes effect on the next one.
+//
+// GGML_METAL_MV_CFG_FILE  path to a file containing "<lz> <nr0> <q6off>"; unparseable -> env
+static void ggml_metal_mul_mv_cfg(int * lz, int * nr0, int * q6off) {
+    static const int lz_env  = getenv("GGML_METAL_MV_R1_LZ")  ? atoi(getenv("GGML_METAL_MV_R1_LZ"))  : 0;
+    static const int nr0_env = getenv("GGML_METAL_MV_R1_NR0") ? atoi(getenv("GGML_METAL_MV_R1_NR0")) : 0;
+    static const char * path = getenv("GGML_METAL_MV_CFG_FILE");
+
+    static const int q6off_env = getenv("GGML_METAL_NO_Q6_NR0") ? 1 : 0;
+
+    static int lz_cur    = lz_env;
+    static int nr0_cur   = nr0_env;
+    static int q6off_cur = q6off_env;
+
+    if (path) {
+        static int64_t last_us = 0;
+
+        const int64_t now_us = ggml_time_us();
+
+        if (now_us - last_us >= 50000) {
+            last_us = now_us;
+
+            FILE * f = fopen(path, "r");
+            if (f) {
+                int a = 0;
+                int b = 0;
+                int c = 0;
+                if (fscanf(f, "%d %d %d", &a, &b, &c) == 3) {
+                    lz_cur    = a;
+                    nr0_cur   = b;
+                    q6off_cur = c;
+                }
+                fclose(f);
+            }
+        }
+    }
+
+    *lz    = lz_cur;
+    *nr0   = nr0_cur;
+    *q6off = q6off_cur;
+}
+
+// true when the Q6_K wide-verify default is switched off, by env or by the runtime gate file
+static bool ggml_metal_mul_mv_q6_nr0_off(void) {
+    int lz = 0;
+    int nr0 = 0;
+    int q6off = 0;
+    ggml_metal_mul_mv_cfg(&lz, &nr0, &q6off);
+    return q6off != 0;
+}
+
+static int ggml_metal_mul_mv_r1_nr0(void) {
+    int lz = 0;
+    int nr0 = 0;
+    int q6off = 0;
+    ggml_metal_mul_mv_cfg(&lz, &nr0, &q6off);
+    return (nr0 == 1 || nr0 == 2 || nr0 == 4 || nr0 == 8) ? nr0 : 0;  // 8 exists for q6_K only
+}
+
+// A4-lazyscale: select the lazy-scale-decode Q4_K multi-column kernels at this nr0. Only q4_K has
+// them; the value is ignored for q5_K/q6_K. Takes precedence over GGML_METAL_MV_R1_NR0.
+static int ggml_metal_mul_mv_r1_lz(void) {
+    int lz = 0;
+    int nr0 = 0;
+    int q6off = 0;
+    ggml_metal_mul_mv_cfg(&lz, &nr0, &q6off);
+    return (lz == 2 || lz == 4 || lz == 8) ? lz : 0;
+}
+
+// A6-ablate: select a WRONG-ANSWER cost-attribution kernel. Needs two switches, not one, because
+// these kernels silently produce garbage and must not be reachable from a normal measurement run.
+// Returns 0 unless both GGML_METAL_ABLATE_UNSAFE and a mode in 1..4 are set. q4_K, nr1 = 3 only.
+// A8-lanes16: sixteen lanes per super-block instead of eight. q4_K only. Bit-exact - it is the
+// same arithmetic in the same order, redistributed across lanes.
+static int ggml_metal_mul_mv_r1_l16(void) {
+    static const int v = getenv("GGML_METAL_MV_R1_L16") ? atoi(getenv("GGML_METAL_MV_R1_L16")) : 0;
+    return (v == 2 || v == 4) ? v : 0;
+}
+
+// A7-vecacc: float4 accumulators instead of scalar dot(). q4_K only for now. Not bit-exact.
+static int ggml_metal_mul_mv_r1_va(void) {
+    static const int v = getenv("GGML_METAL_MV_R1_VA") ? atoi(getenv("GGML_METAL_MV_R1_VA")) : 0;
+    return (v == 1 || v == 2 || v == 4) ? v : 0;
+}
+
+static int ggml_metal_mul_mv_r1_abl(void) {
+    static const bool armed = getenv("GGML_METAL_ABLATE_UNSAFE") != nullptr;
+    static const int  v     = getenv("GGML_METAL_MV_R1_ABL") ? atoi(getenv("GGML_METAL_MV_R1_ABL")) : 0;
+    return (armed && v >= 1 && v <= 4) ? v : 0;
+}
+
+// suffix for the multi-column K-quant mat-vec kernel: "_r1_<nr1k>" plus, when an override is
+// active, "_r0_<nr0>" or "_lz_<nr0>". Writes into caller-owned storage because `suffix` outlives
+// the call.
+static const char * ggml_metal_mul_mv_nr1_suffix(char * buf, size_t bufsz, int nr1k, int nr0_ovr, int lz) {
+    if (lz) {
+        snprintf(buf, bufsz, "_r1_%d_lz_%d", nr1k, lz);
+    } else if (nr0_ovr) {
+        snprintf(buf, bufsz, "_r1_%d_r0_%d", nr1k, nr0_ovr);
+    } else {
+        snprintf(buf, bufsz, "_r1_%d", nr1k);
+    }
+    return buf;
+}
+
 // number of src1 columns that one threadgroup of the multi-column K-quant mat-vec kernels handles.
 // the kernels are instantiated for nr1 = 2, 3, 4; anything else falls back to the nr1 == 1 kernel.
 // for ne11 that is not covered exactly, pick the divisor that wastes the fewest column slots.
@@ -831,6 +973,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const ggml_type tsrc1 = op->src[1]->type;
 
     const char * suffix = "";
+
+    char        sbuf_nr1[32];                                 // storage for the K-quant nr1 suffix
+    const int   nr0_ovr = ggml_metal_mul_mv_r1_nr0();
+    const int   lz_ovr  = ggml_metal_mul_mv_r1_lz();
 
     // use custom matrix x vector kernel
     switch (tsrc0) {
@@ -910,9 +1056,30 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
                 const int nr1k = ggml_metal_mul_mv_nr1_k(ne11);
                 if (nr1k > 1) {
-                    nr0    = N_R0_Q4_K_R1;
-                    nr1    = nr1k;
-                    suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                    const int abl = ggml_metal_mul_mv_r1_abl();
+                    const int va  = ggml_metal_mul_mv_r1_va();
+                    const int l16 = ggml_metal_mul_mv_r1_l16();
+
+                    if (l16) {
+                        nr0 = l16;
+                        nr1 = nr1k;
+                        snprintf(sbuf_nr1, sizeof(sbuf_nr1), "_r1_%d_l16_%d", nr1k, l16);
+                        suffix = sbuf_nr1;
+                    } else if (va) {
+                        nr0 = va;
+                        nr1 = nr1k;
+                        snprintf(sbuf_nr1, sizeof(sbuf_nr1), "_r1_%d_va_%d", nr1k, va);
+                        suffix = sbuf_nr1;
+                    } else if (abl && nr1k == 3) {
+                        nr0 = nr0_ovr == 4 ? 4 : 2;
+                        nr1 = nr1k;
+                        snprintf(sbuf_nr1, sizeof(sbuf_nr1), "_r1_3_abl_%d_%d", nr0, abl);
+                        suffix = sbuf_nr1;
+                    } else {
+                        nr0    = lz_ovr ? lz_ovr : (nr0_ovr ? nr0_ovr : N_R0_Q4_K_R1);
+                        nr1    = nr1k;
+                        suffix = ggml_metal_mul_mv_nr1_suffix(sbuf_nr1, sizeof(sbuf_nr1), nr1k, nr0_ovr, lz_ovr);
+                    }
                 }
             } break;
         case GGML_TYPE_Q5_K:
@@ -922,9 +1089,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
                 const int nr1k = ggml_metal_mul_mv_nr1_k(ne11);
                 if (nr1k > 1) {
-                    nr0    = N_R0_Q5_K_R1;
+                    nr0    = nr0_ovr ? nr0_ovr : N_R0_Q5_K_R1;
                     nr1    = nr1k;
-                    suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                    suffix = ggml_metal_mul_mv_nr1_suffix(sbuf_nr1, sizeof(sbuf_nr1), nr1k, nr0_ovr, 0);
                 }
             } break;
         case GGML_TYPE_Q6_K:
@@ -934,9 +1101,29 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
                 const int nr1k = ggml_metal_mul_mv_nr1_k(ne11);
                 if (nr1k > 1) {
-                    nr0    = N_R0_Q6_K_R1;
+                    // A5-q6nr0. The multi-column mat-vec is bound by ACTIVATION-read traffic, which
+                    // is (ne01/nr0)*nr1*ne00*4 bytes of requests; widths 2-4 all sit on one ~2.3 TB/s
+                    // ceiling while width 1 sits under it, DRAM-bound on the weights. nr0 is the only
+                    // knob that divides that traffic, and Q6_K is the one K-quant whose multi-column
+                    // kernel can take it: it reads its int8 sub-block scales inline, where q4_K and
+                    // q5_K hoist all four into 8*nr0 registers held across the super-block.
+                    //
+                    // Measured on the real tensors, both order halves, control drift 1.001x:
+                    //   ffn_down  k=17408 m=5120    width 3 0.74x   width 4 0.58x
+                    //   attn_qkv  k=5120  m=10240   width 3 0.74x   width 4 0.63x
+                    //   output    k=5120  m=248320  width 3 0.73x   width 4 0.71x
+                    //
+                    // Gated on width, because at nr1 = 2 it is 1.01-1.06x - the extra rows only pay
+                    // once the activation stream is the binding constraint. Gated on ne01, because
+                    // nr0=4 leaves ne01/(nr0*nsg) threadgroups and a 1024-row matrix drops to 128 of
+                    // them across 32 cores, where it loses 1.5x. Bit-exact either way: each simdgroup
+                    // computes whole rows and reduces within itself.
+                    const bool wide = nr1k >= 3 && ne01 >= 4096 && !ggml_metal_mul_mv_q6_nr0_off();
+
+                    nr0    = nr0_ovr ? nr0_ovr : (wide ? 4 : N_R0_Q6_K_R1);
                     nr1    = nr1k;
-                    suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                    suffix = ggml_metal_mul_mv_nr1_suffix(sbuf_nr1, sizeof(sbuf_nr1), nr1k,
+                                                          nr0_ovr ? nr0_ovr : (wide ? 4 : 0), 0);
                 }
             } break;
         case GGML_TYPE_IQ2_XXS:
@@ -996,6 +1183,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 GGML_ABORT("not implemented");
             }
     };
+
+    // L1-runlen: diagnostic override of the simdgroups-per-threadgroup count for the K-quant
+    //            mat-vec. nsg is the ONE geometry knob this project has never turned - only N_R0
+    //            and N_R0_*_R1 were swept. It is the control that separates "contiguous run length
+    //            per threadgroup" from "number of threadgroups": raising nsg halves the grid
+    //            (dispatch is (ne01 + nr0*nsg - 1)/(nr0*nsg)) at identical nr0, identical registers
+    //            and an identical per-simdgroup stream.
+    //
+    //            Bit-exact across values: each simdgroup computes whole rows, the reduction is
+    //            simd_sum within one simdgroup, and the kernel guards first_row + row < ne0.
+    //            Only applies where the kernel uses no threadgroup memory, so smem stays valid.
+    {
+        static const int nsg_override = getenv("GGML_METAL_MV_NSG") ? atoi(getenv("GGML_METAL_MV_NSG")) : 0;
+
+        if (nsg_override > 0 && smem == 0) {
+            nsg = std::min(nsg_override, 32); // nsg*32 threads must fit maxTotalThreadsPerThreadgroup
+        }
+    }
 
     GGML_ASSERT(ne12 <= INT16_MAX && ne13 <= INT16_MAX);
     const int16_t r2 = (int16_t) (ne12 / ne02);

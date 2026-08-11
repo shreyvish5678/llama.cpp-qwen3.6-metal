@@ -565,6 +565,23 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     ggml_metal_set_n_cb(ctx, n_cb);
 }
 
+// X-ncb: the number of extra command-buffer encoding threads is hardcoded to 1 at both backend
+//        creation sites, and nothing in llama.cpp/common/tools ever calls the setter. The value is
+//        justified by a comment referencing M1 Pro / M2 Ultra on LLaMA-shaped graphs; this model
+//        evaluates ~1865 nodes per decode step, of which one worker thread encodes ~1679 serially.
+//        Make it measurable. Default is 1, i.e. byte-identical to shipped.
+static int ggml_backend_metal_default_n_cb(void) {
+    const char * s = getenv("GGML_METAL_NCB");
+
+    if (!s) {
+        return 1;
+    }
+
+    const int v = atoi(s);
+
+    return v < 1 ? 1 : v;
+}
+
 static ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
@@ -608,7 +625,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 }
@@ -702,7 +719,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 

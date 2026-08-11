@@ -1703,6 +1703,29 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         const int n_token_batches = (ne1 + BATCH_SIZE - 1) / BATCH_SIZE;
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, n_token_batches, ne02, BATCH_SIZE, 1, 1);
     } else {
+        // W-ssmconv: the shipped path here dispatches ne01 threadgroups of ONE thread each.
+        //            For this model ne01 = 10,240 conv channels, times 48 gated-delta-net layers
+        //            = 491,520 single-thread threadgroups per decoded token, at 1/32 lane
+        //            utilisation. GGML_METAL_SSMCONV_CH=<threads> parallelises over channels
+        //            instead. 0 or unset keeps the shipped dispatch exactly.
+        static const int ssmconv_ch = getenv("GGML_METAL_SSMCONV_CH") ? atoi(getenv("GGML_METAL_SSMCONV_CH")) : 0;
+
+        if (ssmconv_ch > 0) {
+            const int ntg = std::min(ssmconv_ch, 1024);
+
+            auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_ch(lib, op);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         3);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + ntg - 1)/ntg, ne1, ne02, ntg, 1, 1);
+
+            return 1;
+        }
+
         auto pipeline = ggml_metal_library_get_pipeline_ssm_conv(lib, op);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
