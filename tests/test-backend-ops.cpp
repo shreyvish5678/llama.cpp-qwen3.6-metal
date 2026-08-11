@@ -9202,6 +9202,45 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // CRITIC-MM: mul_mm output-tile coverage. Metal takes the matrix-matrix kernel only at
+    // ne11 > 8, and the threadgroup tile is 64 (rows) x NR1 (cols). Every partial tile in BOTH
+    // dimensions has to be exercised, including n just above 8, n straddling 32 and 64, and m
+    // that is not a multiple of 64. k = 256 keeps every K-quant legal; the f16/f32 rows also
+    // run k = 100 so that ne00 % 32 != 0 and the bounds-checked INPUT staging path fires.
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int m : {32, 63, 64, 65, 127, 128, 1024}) {
+            for (int n : {9, 12, 16, 31, 32, 33, 63, 64, 65, 96, 127, 128}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 256, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    // batched, so the im indexing of the output tile is covered too
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_K}) {
+        for (int n : {9, 33, 63, 65, 127}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 67, n, 256, {2, 3}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 67, n, 256, {2, 3}, {2, 2}));
+        }
+    }
+    // CRITIC-MM: src1 row stride expressed in ELEMENTS is >= 32768 here, so any 16-bit
+    // intermediate holding that stride wraps negative. n > 32 so the far half of a 64-wide
+    // output tile is actually stored and a wrapped stride cannot hide.
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_K}) {
+        for (int k : {16384, 32768, 40960}) {
+            for (int n : {12, 40, 96}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
+    // ne00 % 32 != 0 -> FC_mul_mm_bc_inp, the other staging path
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int m : {63, 64, 65, 128}) {
+            for (int n : {9, 31, 33, 63, 65, 127}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 100, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4, 8}) {
@@ -10086,6 +10125,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 128, 128, 4, 4 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 2048, 16, 5, 4 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 20000, 10, 4, 1 }));
+
+    // CRITIC-MM: the real Qwen3.6-27B prefill mat-muls. The stock perf list reaches the Metal
+    // matrix-matrix kernel at exactly one shape (4096 x 512 x 14336), so a mul_mm change measured
+    // on it alone is measured on one point. n = 512 is the real llama-bench pp512 ubatch width;
+    // 9/32/63 are partial output tiles either side of the 32 and 64 column boundaries.
+    {
+        struct mm_shape { ggml_type t; int64_t m, k; const char * what; };
+        static const mm_shape mm_shapes[] = {
+            { GGML_TYPE_Q4_K,  6144,  5120, "attn_q"    },
+            { GGML_TYPE_Q4_K,  1024,  5120, "attn_kv"   },
+            { GGML_TYPE_Q4_K,  5120,  6144, "attn_out"  },
+            { GGML_TYPE_Q4_K, 17408,  5120, "ffn_gate"  },
+            { GGML_TYPE_Q6_K,  5120, 17408, "ffn_down"  },
+            { GGML_TYPE_Q5_K,  5120,  6144, "ssm_out"   },
+            { GGML_TYPE_F16,   5120,  5120, "f16"       },
+            { GGML_TYPE_F32,   5120,  5120, "f32"       },
+        };
+        for (int64_t n : {9, 32, 63, 512}) {
+            for (const mm_shape & s : mm_shapes) {
+                test_cases.emplace_back(new test_mul_mat(s.t, GGML_TYPE_F32, s.m, n, s.k, {1, 1}, {1, 1}));
+            }
+        }
+    }
 
     for (int bs : {1, 2, 3, 4, 5, 8, 512}) {
         for (ggml_type type_a : all_types) {

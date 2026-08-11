@@ -752,7 +752,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const bool bc_out = has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
-        : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
+        : (op->ne[0] % 64  != 0 || op->ne[1] % 64  != 0);   // MM-tile32: NR1 is 64, not 32
 
     GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
     const int16_t ne12 = (int16_t) op->src[1]->ne[2];
@@ -787,10 +787,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
         res.smem = smem_a;
     } else {
+        // MM-tile32: the threadgroup tile is 64x64, i.e. 32x32 per simdgroup across 4 simdgroups.
+        //   sa  = 64 rows x 32 k x 2 B = 4096
+        //   sb  = 64 cols x 32 k x 2 B = 4096
+        //   out staging (bounds-checked path only) = 64 x 64 floats = 16384
         res.nr0 = 64;
-        res.nr1 = 32;
+        res.nr1 = 64;
 
-        res.smem = bc_out ? 8192 : (4096 + 2048);
+        res.smem = bc_out ? 16384 : (4096 + 4096);
     }
 
     res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
