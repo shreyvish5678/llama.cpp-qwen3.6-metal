@@ -19,8 +19,13 @@ near-tie that flips either way).
 
 **Both figures were read off a run, not derived** — prefill over 9 order-balanced arms with a
 control that reproduced to 0.05 %, decode rested alongside its own unspeculated arm in the same
-session. Cross-session absolutes on this machine carry ~8 % of drift, more than most individual
-results, so derived numbers are not quoted.
+session. Absolutes on this machine drift ~8 % between sessions, so nothing here composes numbers
+taken on different days.
+
+MLX is the nearest comparable engine, not the target; the hardware is. Prefill's `mul_mm` runs at
+~77 % of this chip's 12.93 TFLOP/s scalar roof — **there is no matrix unit on M4**, `matmul2d`
+lowers onto the ordinary shader path. Unspeculated decode at one token per forward pass cannot
+exceed **25.5 tok/s**: 410 GB/s over a 16.1 GB read. All remaining decode headroom is speculative.
 
 The −14 % unspeculated is mostly not a kernel deficit: **11.6 points of MLX streaming fewer bytes**
 (uniform 4.5 bpw against Q4_K_M's Q6_K/Q5_K promotions, a quality difference) × **6.3 points of
@@ -28,23 +33,45 @@ rate**. Both engines sit inside the 73–85 % of peak normal for an M4-generatio
 
 ## The changes
 
+### 0. A column dimension for the K-quant mat-vec — everything else builds on it
+
+Upstream's dedicated K-quant mat-vec handles one `src1` column per threadgroup. Speculative
+verification presents two to four. This adds compile-time column variants (`_r1_2`, `_r1_3`,
+`_r1_4`) for q4_K/q5_K/q6_K, so the expensive 6-bit scale decode is paid **once** and amortised
+across the columns. Register pressure sets the shape: `nr0*nr1` accumulators plus `nr1` float4s of
+live activations, so the multi-column variants carry their own `N_R0_*_R1` constants, all 2.
+
+**1.431× on speculative decode**, and 1.43× again with the arm order reversed. Acceptance and
+tokens-per-forward both moved *down* (0.7549 → 0.7507, 3.253 → 3.242), so the gain provably is not
+coming from drafting. Sections 1 and 4 tune this kernel further.
+
+Two more things ride on the branch:
+
+- **The gated-delta-net state write is fused into the recurrent state cache**, removing one `cpy`
+  per layer. Upstream's own version of this fusion (PR #25788), ported verbatim, fires **0 times out
+  of 192** here: `ggml_metal_graph_optimize_reorder()` hoists a node in between the
+  `GATED_DELTA_NET` and its `CPY`, so upstream's "the CPY is the next node" test never holds.
+  Matching the snapshot view by identity and pinning the pair gets 192/192.
+- **An FR-Spec draft-vocabulary trim** (arXiv:2502.14856), inert unless `LLAMA_MTP_VOCAB_N` and
+  `LLAMA_MTP_VOCAB_FILE` are set. It restricts the *draft* head to a frequency-ranked row subset;
+  the target head stays at full vocabulary, so verification is unchanged. Measured +2.8 % on a
+  single non-interleaved pair, ~1.6 σ. **Not confirmed, and not in the 29.0 above.**
+
 ### 1. Sixteen lanes per super-block for the Q4_K multi-column mat-vec — decode +6.7 %
 
-Speculative decoding verifies several tokens per pass, so the kernel that matters is the
-multi-column mat-vec, not the one-column one. Q4_K is 65 % of what decode reads.
+Q4_K is 65 % of what decode reads, so its multi-column kernel is the one that matters. It put
+**eight** lanes on a super-block, each reading one `float4` at a stride of eight floats — so four
+lanes cover 64 bytes of a 128-byte line and the rest is discarded. Sixteen contiguous lanes cover
+the line exactly.
 
-That kernel put **eight** lanes on a super-block, each reading one `float4` at a stride of eight
-floats — so four lanes cover 64 bytes of a 128-byte line and the rest is discarded. Sixteen
-contiguous lanes cover the line exactly.
+**Neither half of the fix works alone** (kernel time, lower is faster). Four rows per simdgroup
+instead of two is 0.98×; sixteen lanes at the old two rows is 1.083×. Together, **0.86× at verify
+width 3**, on all four real Q4_K shapes within half a percent of each other. Halving the requested
+*bytes* had never helped because it did not reduce the line *transactions*. Q6_K already used
+sixteen lanes, which is the real reason it had taken the wider tile and Q4_K had not.
 
-**Neither half of the fix works alone.** Four rows per simdgroup instead of two is 0.98×; sixteen
-lanes at the old two rows is 1.083×. Together, **0.86× at verify width 3**, on all four real Q4_K
-shapes within half a percent of each other. Halving the requested *bytes* had never helped because
-it did not reduce the line *transactions*. Q6_K already used sixteen lanes, which is the real reason
-it had taken the wider tile and Q4_K had not.
-
-End to end **+6.7 %**, reproduced twice by a reviewer to within 0.02 points against two A/A nulls
-bracketing 1.000, and collapsing to 1.001 at `n_max = 1` where the kernel cannot fire.
+End to end **+6.7 %**, reproduced twice to within 0.02 points against two A/A nulls bracketing
+1.000, and collapsing to 1.001 at `n_max = 1` where the kernel cannot fire.
 `GGML_METAL_NO_Q4_L16=1` restores the old behaviour.
 
 ### 2. A 32×32 accumulator tile for the quantised `mul_mm` — prefill +3.9 %
@@ -83,27 +110,30 @@ more accurate rather than faster.
 it is 1.01–1.06×, and on rows because a 1024-row matrix would drop to 128 threadgroups across 32
 cores. `GGML_METAL_NO_Q6_NR0=1` restores the old behaviour.
 
-Its mechanism was open when this file was first written and is now settled: a structural dump of the
-decode graph counts **0** gated nodes at verify width 2, **57** at width 3 and **56** at width 4,
-exactly as the gate specifies, and the change covers **27.4 %** of the decode weight stream — which
-sizes the measured +4.1 % without a residual.
+Mechanism: a structural dump of the decode graph counts **0** gated nodes at verify width 2, **57**
+at width 3 and **56** at width 4, exactly as the gate specifies, and the change covers **27.4 %** of
+the decode weight stream — which sizes the measured +4.1 % without a residual.
 
 ## Test coverage worth upstreaming on its own
 
-Upstream `test-backend-ops` had **one** `mul_mm` perf shape and almost no partial-tile coverage, and
-no quantised K-quant mat-vec case above **`ne01 = 16`**. Any backend that switches kernels on row
-count or tile geometry is untested there, and a green suite says nothing about it.
+`test-backend-ops` runs green on things it cannot see, and that bit this fork twice.
 
-That bit this fork twice. Change 4 passed 1143/1143 with its gate **on and off** — both arms ran
-identical code and the test could not have failed. Change 2 encodes its tile in six independent
-places and **four were wrong** in the first version; the last, a `short` holding a 64-bit row stride
-that wraps past `k = 32768` and reads ~4 MB before the buffer, needed cases nobody had written.
+**It has no quantised K-quant mat-vec case above `ne01 = 16`, one `mul_mm` perf shape, and almost no
+partial-tile coverage.** Any backend that switches kernels on row count or tile geometry is untested
+there. Change 4 passed 1143/1143 with its gate **on and off** — both arms ran identical code and the
+test could not have failed. Change 2 encodes its tile in six independent places and **four were
+wrong** in the first version; the last, a `short` holding a 64-bit row stride that wraps past
+`k = 32768` and reads ~4 MB before the buffer, needed cases nobody had written.
+
+**It also never calls `graph_optimize`.** A graph-level fusion can therefore pass every unit test and
+still fire zero times in production, which is exactly what upstream's gated-delta-net fusion does
+here (section 0).
 
 This fork adds `ne01` ∈ {4088, 4095, 4096, **4100**, 4104} × `n` ∈ {2,3,4} for q4_K/q5_K/q6_K,
 `mul_mm` partial tiles in both dimensions across both staging paths, and the large-stride shapes.
 **That block is independent of every Metal change here and is the piece most worth taking.**
 
-Verification looks like this — the pipeline count, not the pass, is the evidence:
+Check a kernel-selection change by pipeline count, not by the pass:
 
 ```
                           tests          gated pipelines compiled
@@ -111,12 +141,12 @@ default                   14581/14581    4
 GGML_METAL_NO_Q4_L16=1    14581/14581    0
 ```
 
-`strings` on the dylib does **not** work as a check for kernel selection: with
-`GGML_METAL_EMBED_LIBRARY` the `host_name`s are produced by the Metal preprocessor at
-`ggml_metal_init`, so a name built from a macro argument exists nowhere in the binary. (The Metal
-*source* is embedded as text, so source-level changes can be diffed that way — kernel names cannot.)
+`strings` on the dylib does **not** work as that check: with `GGML_METAL_EMBED_LIBRARY` the
+`host_name`s come from the Metal preprocessor at `ggml_metal_init`, so a name built from a macro
+argument exists nowhere in the binary. The Metal *source* is embedded as text, so source-level
+changes can be diffed that way — kernel names cannot.
 
-## What is not established
+## Known limits, and one thing not to re-propose
 
 **A pre-existing out-of-bounds read gets wider.** These mat-vec kernels guard the *store*
 (`first_row + row < args.ne0`) but not the *load*, so the last threadgroup reads up to
@@ -128,10 +158,10 @@ results are still correct. Not fixed here.
 — 16 per core on a 32-core part — written as a row count because that is what the dispatch has to
 hand. Another part should re-derive it rather than inherit it.
 
-**What limits the decode mat-vec is now known to differ by width**: verify width 3 is
-instruction-bound and width 4 is register-bound, and the same change can help one and hurt the
-other. A packed-scale variant that saves 18 registers is 8 % *faster* at width 4 and 7 % *slower* at
-width 3, so it is not shipped.
+**What limits the decode mat-vec differs by width**, so a win at one width is not a win. Verify
+width 3 is instruction-bound and width 4 is register-bound: a packed-scale variant that saves 18
+registers is 8 % *faster* at width 4 and 7 % *slower* at width 3, so it is not shipped. This model's
+operating point never reaches width 4, which makes instruction count the axis that matters.
 
 ## Build
 
