@@ -1,6 +1,7 @@
-> **This is a fork.** It carries Metal-backend tuning for Qwen3.6-27B on an Apple M4 Max —
-> ~+37 % decode against MLX with speculative decoding on, and a `test-backend-ops` coverage gap
-> worth upstreaming. What changed, what it measures, and what is still unexplained about it:
+> **This is a fork.** Metal-backend tuning for Qwen3.6-27B on an Apple M4 Max — **+37 % prefill and
+> +36 % decode against MLX** — plus two things worth upstreaming on their own: a `dequantize_q4_K`
+> scale that goes subnormal for 99.9998 % of blocks on every Q4_K model, and the `test-backend-ops`
+> coverage gap that let four tile-geometry bugs pass a green suite. Details:
 > **[QWEN36-METAL.md](QWEN36-METAL.md)**. Branch `shipped` is the tuned stack; `master` is the
 > upstream commit it forks from.
 

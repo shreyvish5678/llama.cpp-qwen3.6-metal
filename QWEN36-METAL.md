@@ -1,121 +1,137 @@
 # llama.cpp — Metal tuning for Qwen3.6-27B on an M4 Max
 
-A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) carrying Metal-backend changes aimed
-at one model on one machine: **Qwen3.6-27B-A3B (Q4_K_M) on a 32-core M4 Max, 410 GB/s, 36 GB**.
+A fork carrying Metal-backend changes aimed at one model on one machine: **Qwen3.6-27B (Q4_K_M) on
+a 32-core M4 Max, 410 GB/s, 36 GB**. Branch `shipped` is the tuned stack; `master` is the upstream
+commit it forks from (`3653e6d6d`), kept so the diff stays readable.
 
-Branch **`shipped`** is the tuned stack. `master` is the upstream commit it forks from
-(`3653e6d6d`), kept so the diff is readable.
-
-Everything below was measured on that machine with speculative decoding (MTP) at depth 2. Numbers
-are from a frozen 10-prompt set across code generation, code regeneration, prose, long context and
-JSON. **Nothing here is a general llama.cpp speedup claim** — it is one model, one chip, and some
-of it is tuned to both.
+**Nothing here is a general llama.cpp speedup claim.** It is one model on one chip, and some of it
+is tuned to both. Two pieces are worth upstreaming anyway and are called out below.
 
 | | this fork | MLX 4-bit | vs MLX |
 |---|---|---|---|
-| decode, speculation on | **29.3 tok/s** | 21.4 | **+37 %** |
-| decode, speculation off | 18.2 | 21.4 | −15 % |
-| prefill (pp512) | **193.4 tok/s** | 148.2 | **+30 %** |
+| prefill (pp512) | **203.4 tok/s** | 148.2 | **+37 %** |
+| decode, speculation on | **29.0 tok/s** | 21.4 | **+36 %** |
+| decode, speculation off | 18.4 | 21.4 | −14 % |
 
-The −15 % on unspeculated decode is mostly not a kernel deficit: it factors into **11.6 points of
-MLX streaming fewer bytes** (uniform 4.5 bpw against Q4_K_M's Q6_K/Q5_K promotions — a quality
-difference, not a speed one) times **6.3 points of rate**. Both engines sit inside the 73–85 % of
-peak that is normal for an M4-generation Metal streaming read.
+Decode is speculative (MTP, depth 2, `p_min` 0.6): acceptance 0.943, 2.49 tokens per forward pass,
+output byte-identical to unspeculated greedy on 9 of 10 frozen prompts (the tenth is a long-context
+near-tie that flips either way).
 
-## The change on top of the earlier stack
+**Both figures were read off a run, not derived** — prefill over 9 order-balanced arms with a
+control that reproduced to 0.05 %, decode rested alongside its own unspeculated arm in the same
+session. Cross-session absolutes on this machine carry ~8 % of drift, more than most individual
+results, so derived numbers are not quoted.
 
-**A wider row tile for the Q6_K multi-column mat-vec at speculative verify widths ≥ 3.**
+The −14 % unspeculated is mostly not a kernel deficit: **11.6 points of MLX streaming fewer bytes**
+(uniform 4.5 bpw against Q4_K_M's Q6_K/Q5_K promotions, a quality difference) × **6.3 points of
+rate**. Both engines sit inside the 73–85 % of peak normal for an M4-generation streaming read.
 
-Speculative decoding verifies several tokens per forward pass, so the kernel that matters is not
-the one-column mat-vec but the multi-column one. On this model that kernel family is **~56 % of the
-whole speculative decode cycle** — measured by forcing a knob with a known op-level cost (one row
-per simdgroup, a 1.5× slowdown) and observing 22 % end-to-end, then solving for the share.
+## The changes
 
-It is bound by **activation-read traffic, not the weight stream.** One threadgroup requests
-`(ne01/nr0)·nr1·ne00·4` bytes of `src1`. Adding weights and dividing by measured time puts widths
-2, 3 and 4 on a single ceiling near 2.3 TB/s, while width 1 sits well under it, DRAM-bound:
+### 1. Sixteen lanes per super-block for the Q4_K multi-column mat-vec — decode +6.7 %
 
-| q4_K m=4096 k=14336 | activation requests | + weights | µs | rate |
-|---|---|---|---|---|
-| width 1 | 117 MB | 150 MB | 89.3 | 1.68 TB/s |
-| width 2 | 235 | 268 | 118.2 | 2.27 |
-| width 3 | 352 | 385 | 166.7 | 2.31 |
-| width 4 | 470 | 503 | 222.4 | 2.26 |
+Speculative decoding verifies several tokens per pass, so the kernel that matters is the
+multi-column mat-vec, not the one-column one. Q4_K is 65 % of what decode reads.
 
-`nr0` — rows per simdgroup — is the only knob that divides that traffic. Halving it to 1 costs
-**1.51×** pooled over 26 shapes. Doubling it to 4 pays, **but only for Q6_K**, and the source says
-why: `kernel_mul_mv_q6_K_f32_nr1_impl` reads its int8 sub-block scales inline, where the q4_K and
-q5_K versions hoist all four into `ds[nr0][4] + dm[nr0][4]` — `8·nr0` registers held across the
-whole super-block — and have no room left.
+That kernel put **eight** lanes on a super-block, each reading one `float4` at a stride of eight
+floats — so four lanes cover 64 bytes of a 128-byte line and the rest is discarded. Sixteen
+contiguous lanes cover the line exactly.
 
-Measured on this model's real Q6_K tensors, both order halves, closing control within 0.1 %:
+**Neither half of the fix works alone.** Four rows per simdgroup instead of two is 0.98×; sixteen
+lanes at the old two rows is 1.083×. Together, **0.86× at verify width 3**, on all four real Q4_K
+shapes within half a percent of each other. Halving the requested *bytes* had never helped because
+it did not reduce the line *transactions*. Q6_K already used sixteen lanes, which is the real reason
+it had taken the wider tile and Q4_K had not.
 
-| tensor | k | m | width 3 | width 4 |
-|---|---|---|---|---|
-| `ffn_down` | 17408 | 5120 | **0.74×** | **0.58×** |
-| `attn_qkv` | 5120 | 10240 | **0.74×** | **0.63×** |
-| `output` | 5120 | 248320 | **0.73×** | **0.71×** |
+End to end **+6.7 %**, reproduced twice by a reviewer to within 0.02 points against two A/A nulls
+bracketing 1.000, and collapsing to 1.001 at `n_max = 1` where the kernel cannot fire.
+`GGML_METAL_NO_Q4_L16=1` restores the old behaviour.
 
-End to end: **+4.1 %** over 20 interleaved pairs on one warm server (order gap 0.12 %) and
-**+4.5 %** on an independent four-arm ABBA with a restart per arm, run by a separate reviewer.
-Draft acceptance and tokens-per-forward-pass were identical to four decimals and generated text was
-byte-identical in every pair, so this is the same speculation running faster rather than more of it.
+### 2. A 32×32 accumulator tile for the quantised `mul_mm` — prefill +3.9 %
 
-Gated on width because at width 2 it is 1.01–1.06× — the extra rows only pay once the activation
-stream is the binding constraint. Gated on row count because `nr0 = 4` leaves `ne01/(nr0·nsg)`
-threadgroups, and a 1024-row matrix drops to 128 across 32 cores where it loses 1.5×.
+Each simdgroup held a **32×16** accumulator, so the threadgroup tile was 64×32. Every well-tuned
+Apple GEMM converges on 32×32 per simdgroup — metal-flash-attention's Apple9 config is `32x32x8`,
+MLX's Steel GEMM is 64×64×16 at `wm=wn=2`. Raising it takes fragment loads per multiply-accumulate
+from 6:8 to 8:16 at the same 128 threads and the same four simdgroups.
 
-`GGML_METAL_NO_Q6_NR0=1` restores the previous behaviour in the same binary.
+**195.8 → 203.4 tok/s.** Bit-exact, and tested rather than argued: greedy output byte-identical
+including a 7.5 k-token prefill, and perplexity identical to four decimals over 24 k tokens.
+
+**Known limitation, not fixed here:** below `ne11 = 64` the wider tile is **1.6× slower**
+(1.64 at n=9, 1.62 at n=32, 1.19 at n=63, 0.965 at n=512). Unreachable on this project's operating
+point — prefill runs `ne11 = 512` and speculative verify uses the mat-vec — but routine with
+`--parallel` batching and on a prompt's last partial ubatch. **It needs an `ne11` gate before it is
+proposed upstream.** The differentiator is `ne11`, not `src0` type: at n=9, f16 and q4_K lose
+identically.
+
+### 3. `dequantize_q4_K` divided the super-block scale in half precision — **upstreamable as-is**
+
+`ggml-metal.metal` computed the second-half Q4_K scale as `xb->d / 16.h` — a **half** division. In a
+K-quant `d` is a scale of scales, ~100× smaller than a first-order quant's: the median over all
+78,960,640 Q4_K super-blocks of this model is **6.354e-05**. Divide that by 16 in half precision and
+the quotient is 3.97e-06, below half's smallest normal 6.104e-05 — **subnormal for 99.9998 % of this
+model's blocks**, losing ~3 mantissa bits. `dequantize_q5_K` twenty lines below already wrote `16.f`.
+
+This is on the prefill path (`mul_mm` at batch > 8, plus `get_rows`), so it affects **every Q4_K
+model on Metal**, not just this one. Perplexity 6.6534 → 6.6475 on the frozen wikitext split — lower
+in 23 of 32 chunks and in the last 17 consecutively. One character, and it makes the model slightly
+more accurate rather than faster.
+
+### 4. A wider row tile for the Q6_K multi-column mat-vec at verify widths ≥ 3 — decode +4.1 %
+
+`nr0 = 4` instead of 2 when `nr1 >= 3 && ne01 >= 4096`. Bit-exact. Gated on width because at width 2
+it is 1.01–1.06×, and on rows because a 1024-row matrix would drop to 128 threadgroups across 32
+cores. `GGML_METAL_NO_Q6_NR0=1` restores the old behaviour.
+
+Its mechanism was open when this file was first written and is now settled: a structural dump of the
+decode graph counts **0** gated nodes at verify width 2, **57** at width 3 and **56** at width 4,
+exactly as the gate specifies, and the change covers **27.4 %** of the decode weight stream — which
+sizes the measured +4.1 % without a residual.
+
+## Test coverage worth upstreaming on its own
+
+Upstream `test-backend-ops` had **one** `mul_mm` perf shape and almost no partial-tile coverage, and
+no quantised K-quant mat-vec case above **`ne01 = 16`**. Any backend that switches kernels on row
+count or tile geometry is untested there, and a green suite says nothing about it.
+
+That bit this fork twice. Change 4 passed 1143/1143 with its gate **on and off** — both arms ran
+identical code and the test could not have failed. Change 2 encodes its tile in six independent
+places and **four were wrong** in the first version; the last, a `short` holding a 64-bit row stride
+that wraps past `k = 32768` and reads ~4 MB before the buffer, needed cases nobody had written.
+
+This fork adds `ne01` ∈ {4088, 4095, 4096, **4100**, 4104} × `n` ∈ {2,3,4} for q4_K/q5_K/q6_K,
+`mul_mm` partial tiles in both dimensions across both staging paths, and the large-stride shapes.
+**That block is independent of every Metal change here and is the piece most worth taking.**
+
+Verification looks like this — the pipeline count, not the pass, is the evidence:
+
+```
+                          tests          gated pipelines compiled
+default                   14581/14581    4
+GGML_METAL_NO_Q4_L16=1    14581/14581    0
+```
+
+`strings` on the dylib does **not** work as a check for kernel selection: with
+`GGML_METAL_EMBED_LIBRARY` the `host_name`s are produced by the Metal preprocessor at
+`ggml_metal_init`, so a name built from a macro argument exists nowhere in the binary. (The Metal
+*source* is embedded as text, so source-level changes can be diffed that way — kernel names cannot.)
 
 ## What is not established
 
-**Why it helps as much as it does.** The change only fires when the verify pass is ≥ 3 tokens wide.
-Under this configuration the mean width is 2.575, and the share of wide passes ranges from ~5 % to
-~87 % across the prompt set — so the gain should scale with that share and vanish where there are
-none. It does not: regressing per-prompt gain on it gives slope +0.0001, r = +0.002, and the gain
-extrapolates to +4.5 % where the kernel should never run.
-
-Either the batch width in the verify graph is not what it appears, or part of the gain has another
-source. **The effect itself is not in doubt** — two measurement designs with different failure modes
-agree, and at arm level three patched arms across a 40-minute window read 27.54 / 27.65 / 27.70
-against unpatched arms at 26.62 and 26.34, with no overlap, which is a step on the switch rather
-than a trend in time. But the mechanism is unexplained and stated here rather than smoothed over.
-
 **A pre-existing out-of-bounds read gets wider.** These mat-vec kernels guard the *store*
 (`first_row + row < args.ne0`) but not the *load*, so the last threadgroup reads up to
-`nr0*nsg - 1` rows past `ne01` — 3 rows before this change, 7 after. It is latent on this model
-because every affected tensor has `ne01` divisible by 8, and `test-backend-ops` cannot see it
-because the results are still correct. It is not fixed here.
+`nr0*nsg - 1` rows past `ne01` — 3 rows before these changes, 7 after. Latent on this model because
+every affected tensor has `ne01` divisible by 8; `test-backend-ops` cannot see it because the
+results are still correct. Not fixed here.
 
-**The thresholds are tuned to this chip.** `ne01 >= 4096` is really a threadgroups-per-core
-quantity — 16 per core on a 32-core part — written as a row count because that is what the dispatch
-has to hand. Another part should re-derive it rather than inherit it.
+**The thresholds are tuned to this chip.** `ne01 >= 4096` is really a threadgroups-per-core quantity
+— 16 per core on a 32-core part — written as a row count because that is what the dispatch has to
+hand. Another part should re-derive it rather than inherit it.
 
-## Test coverage worth having regardless
-
-Nothing in upstream `test-backend-ops` exercises a K-quant mat-vec above **`ne01 = 16`**. Every
-quantised `MUL_MAT` eval case is 16 rows wide, so any backend that switches kernels on row count is
-untested there and a green suite says nothing about it.
-
-This bit me directly: the change above is gated on `ne01 >= 4096` and passed 1143/1143 with it
-**on and off**, because both arms ran identical code and the test could not have failed.
-
-This fork adds `ne01` ∈ {4088, 4095, 4096, **4100**, 5120} × `n` ∈ {1,2,3,4,8} for q4_K/q5_K/q6_K,
-straddling the boundary in both dimensions, with 4100 as the partial-tile case where
-`first_row + row` runs past the end of the matrix. That block is independent of the Metal change
-and is the piece most worth upstreaming.
-
-Verification now looks like this — note that the count, not just the pass, is the evidence:
-
-```
-                          tests        _r0_4 pipelines compiled
-patch on                  1218/1218    4
-GGML_METAL_NO_Q6_NR0=1    1218/1218    0
-```
-
-`strings` on the dylib does **not** work as a check: with `GGML_METAL_EMBED_LIBRARY` the Metal
-source is embedded as text and kernel `host_name`s are produced by the Metal preprocessor at
-`ggml_metal_init`, so a name built from a macro argument exists nowhere in the binary.
+**What limits the decode mat-vec is now known to differ by width**: verify width 3 is
+instruction-bound and width 4 is register-bound, and the same change can help one and hurt the
+other. A packed-scale variant that saves 18 registers is 8 % *faster* at width 4 and 7 % *slower* at
+width 3, so it is not shipped.
 
 ## Build
 
