@@ -10,9 +10,12 @@ build succeeds, `test-backend-ops` passes **219 q4_K and 135 q6_K MUL_MAT cases 
 the gated kernels are still selected at verify widths 3 and 4, and MTP speculation runs with
 acceptance unchanged to three decimals.
 
-**The throughput figures below predate that sync and have not been re-taken.** Upstream has since
-landed multi-output backend sampling (#25532) and other speculation work, which plausibly moves
-decode. Re-measure with `bench/fullstack_n.sh` on a quiet machine before quoting these as current.
+**The figures below were re-taken after that sync**, so they describe the merged tree. The sync
+changed nothing measurable: pre-sync 31.30 / 18.64, post-sync 30.26 / 18.51, with acceptance and
+tokens-per-forward **identical on all ten frozen prompts** — the same verify passes at the same
+widths, so only wall-clock differed. That pair of runs doubles as an A/A null on provably identical
+work and puts cross-session variation on this machine at **15 %**, which is why a 3 % gap is not
+readable as a regression.
 
 **Nothing here is a general llama.cpp speedup claim.** It is one model on one chip, and some of it
 is tuned to both. Two pieces are worth upstreaming anyway and are called out below.
@@ -20,8 +23,8 @@ is tuned to both. Two pieces are worth upstreaming anyway and are called out bel
 | | this fork | MLX 4-bit | vs MLX |
 |---|---|---|---|
 | prefill (pp512) | **203.4 tok/s** | 148.2 | **+37 %** |
-| decode, speculation on | **31.3 tok/s** | 21.4 | **+46 %** |
-| decode, speculation off | 18.6 | 21.4 | −13 % |
+| decode, speculation on | **30.3 tok/s** | 21.4 | **+41 %** |
+| decode, speculation off | 18.5 | 21.4 | −13 % |
 
 Decode is speculative (MTP, **depth 3**, `p_min` 0.6): acceptance 0.925, **2.94 tokens per forward
 pass**. Output matches unspeculated greedy on 9 of 10 frozen prompts.
