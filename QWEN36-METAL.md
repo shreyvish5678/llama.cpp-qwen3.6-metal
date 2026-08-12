@@ -4,7 +4,7 @@ A fork carrying Metal-backend changes aimed at one model on one machine: **Qwen3
 a 32-core M4 Max, 410 GB/s, 36 GB**. Branch `shipped` is the tuned stack; `master` tracks upstream
 `ggml-org/llama.cpp` and is kept in sync so the diff stays readable.
 
-**Synced with upstream through `a4a4c51f3`.** The merge was clean — upstream barely touched the
+**Synced with upstream through `89e0aa6fd`.** The merge was clean — upstream barely touched the
 Metal mat-vec files this fork changes. Verified after merging: the Metal source compiles, a full
 build succeeds, `test-backend-ops` passes **219 q4_K and 135 q6_K MUL_MAT cases with 0 failures**,
 the gated kernels are still selected at verify widths 3 and 4, and MTP speculation runs with
