@@ -10,16 +10,23 @@ is tuned to both. Two pieces are worth upstreaming anyway and are called out bel
 | | this fork | MLX 4-bit | vs MLX |
 |---|---|---|---|
 | prefill (pp512) | **203.4 tok/s** | 148.2 | **+37 %** |
-| decode, speculation on | **29.0 tok/s** | 21.4 | **+36 %** |
-| decode, speculation off | 18.4 | 21.4 | −14 % |
+| decode, speculation on | **31.3 tok/s** | 21.4 | **+46 %** |
+| decode, speculation off | 18.6 | 21.4 | −13 % |
 
-Decode is speculative (MTP, depth 2, `p_min` 0.6): acceptance 0.943, 2.49 tokens per forward pass,
-output byte-identical to unspeculated greedy on 9 of 10 frozen prompts (the tenth is a long-context
-near-tie that flips either way).
+Decode is speculative (MTP, **depth 3**, `p_min` 0.6): acceptance 0.925, **2.94 tokens per forward
+pass**. Output matches unspeculated greedy on 9 of 10 frozen prompts.
+
+**On that 9/10 — it is a property of the design, not a regression, and it is the same at every
+depth.** Measured in one session against the same unspeculated texts, depth 2 differs on one prompt
+and depth 3 differs on a different one. The verify pass selects its mat-vec kernel by batch width,
+and those instantiations partition the `simd_sum` reduction differently from the width-1 path, so
+the last bits differ. Wherever two tokens are near-tied the argmax flips; the first divergence we
+traced sits mid-JSON-schema with both continuations valid. **Speculative decoding on this backend is
+not bit-exact against non-speculative decoding at any depth.**
 
 **Both figures were read off a run, not derived** — prefill over 9 order-balanced arms with a
-control that reproduced to 0.05 %, decode rested alongside its own unspeculated arm in the same
-session. Absolutes on this machine drift ~8 % between sessions, so nothing here composes numbers
+control that reproduced to 0.05 %, decode alongside its own unspeculated arm in the same session
+with the texts diffed. Absolutes on this machine drift ~8 % between sessions, so nothing here composes numbers
 taken on different days.
 
 MLX is the nearest comparable engine, not the target; the hardware is. Prefill's `mul_mm` runs at
@@ -173,3 +180,39 @@ cmake --build build -j
 ## Licence
 
 MIT, as upstream. See [LICENSE](LICENSE).
+
+
+## Draft depth 3, and why the depth decision had to be re-taken
+
+The last change to this fork is **not a kernel**. It moves the operating point from
+`--spec-draft-n-max 2` to `3`, worth **+6.01 %** — 20 order-balanced pairs on one warm server,
+9.9 σ, every pair and every category positive, order gap 0.12 pp.
+
+Depth 3 had been measured earlier on this fork as a **loss**, and written down as closed. That
+measurement was correct when it was taken. It was taken **before** the Q6_K wide-verify tile
+(`A5-q6nr0`) and the Q4_K sixteen-lane mapping (`A10-q4l16`), both of which are gated on verify
+width and both of which are worth far more at width 4 than at width 3 — A5 alone is **0.58× at
+width 4** against 0.74 at width 3. Depth 3 is the configuration that produces width-4 verify passes.
+
+> A configuration decision is a measurement against a particular kernel stack. It expires when the
+> stack changes. This fork re-derived kernel numbers constantly and had never re-derived a policy
+> number.
+
+**Method note.** The A/B was made possible by giving each draft step its own threshold and setting
+step 2's above 1.0, which disables it — so a depth-3 server expresses depth 2 exactly and both
+depths are comparable inside one model load, seconds apart, instead of two servers ~12 minutes
+apart. That instrument is not part of this branch; only the operating point changed.
+
+## Upstream-worthy bug, independent of anything here
+
+**`--spec-draft-n-max` is unguarded for single-head MTP models.** In `common/speculative.cpp` the
+clamp
+
+```cpp
+this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
+```
+
+sits **inside** the `if (chain_heads)` branch, and `chain_heads` is
+`n_mtp_layers > 1 && !is_mem_shared`. A model with exactly one prediction head — this one has only
+`blk.64.nextn.*` — therefore never reaches the clamp and will accept any depth the user asks for.
+Depth 3 happens to work here. Nothing stops someone asking for 8.
