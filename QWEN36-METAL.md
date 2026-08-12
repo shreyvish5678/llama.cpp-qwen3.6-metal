@@ -1,8 +1,18 @@
 # llama.cpp — Metal tuning for Qwen3.6-27B on an M4 Max
 
 A fork carrying Metal-backend changes aimed at one model on one machine: **Qwen3.6-27B (Q4_K_M) on
-a 32-core M4 Max, 410 GB/s, 36 GB**. Branch `shipped` is the tuned stack; `master` is the upstream
-commit it forks from (`3653e6d6d`), kept so the diff stays readable.
+a 32-core M4 Max, 410 GB/s, 36 GB**. Branch `shipped` is the tuned stack; `master` tracks upstream
+`ggml-org/llama.cpp` and is kept in sync so the diff stays readable.
+
+**Synced with upstream through `a4a4c51f3`.** The merge was clean — upstream barely touched the
+Metal mat-vec files this fork changes. Verified after merging: the Metal source compiles, a full
+build succeeds, `test-backend-ops` passes **219 q4_K and 135 q6_K MUL_MAT cases with 0 failures**,
+the gated kernels are still selected at verify widths 3 and 4, and MTP speculation runs with
+acceptance unchanged to three decimals.
+
+**The throughput figures below predate that sync and have not been re-taken.** Upstream has since
+landed multi-output backend sampling (#25532) and other speculation work, which plausibly moves
+decode. Re-measure with `bench/fullstack_n.sh` on a quiet machine before quoting these as current.
 
 **Nothing here is a general llama.cpp speedup claim.** It is one model on one chip, and some of it
 is tuned to both. Two pieces are worth upstreaming anyway and are called out below.
