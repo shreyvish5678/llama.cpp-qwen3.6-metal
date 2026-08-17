@@ -11070,6 +11070,9 @@ constant short FC_mul_mm_ne12  [[function_constant(FC_MUL_MM + 2)]];
 constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
+// MM-pipeline kill switch. A function constant, so each pipeline compiles exactly ONE of the two
+// forms below and the unused one costs nothing -- same mechanism FC_mul_mm_bc_inp already uses.
+constant bool  FC_mul_mm_pipe  [[function_constant(FC_MUL_MM + 6)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -11264,7 +11267,57 @@ kernel void kernel_mul_mm(
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 
+    // MM-pipeline: hoisted out of the k-loop so the prefetch below can use it. Value and type are
+    // unchanged. CRITIC-FIX kept: `int64_t`, was `short` -> wrapped at k >= 32768 (hazard 22).
+    const int64_t ry = args.nb11/sizeof(T1);
+
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        // MM-pipeline: issue the B-tile DEVICE loads HERE, above the WAR barrier, and hold the
+        // values in registers until the threadgroup store below.
+        //
+        // The A side already loads above that barrier -- `dequantize_func` sits at the top of the
+        // else-branch, before `threadgroup_barrier`. The B side did not: shipped loaded from device
+        // AND stored to threadgroup between the two barriers, where no simdgroup_multiply_accumulate
+        // is in flight, so that load latency and its float->half converts were covered by nothing.
+        // This makes B symmetric with A. It moves ONE device-load latency per k-slice into the
+        // barrier-free region that holds the previous k-slice's 64 MMAs.
+        //
+        // Cost: 2 x S1_2x4 = 16 halves = 8 32-bit registers per lane, live across ONE barrier and
+        // NOT across the MMA block. No new simdgroup_matrix object, no new threadgroup memory, no
+        // arithmetic changed, no barrier added or removed. Output is bit-identical by construction.
+        //
+        // TWO NAMED VALUES, NOT AN ARRAY, and the jb loop is unrolled by hand. `S1_2x4 tb[2]` with
+        // `FOR_UNROLL` was tried first and it does not work: the Metal frontend ignores the unroll
+        // pragma (.notes/metal-toolchain.md section 2), so the array stayed an `alloca` and the
+        // store to `sb` lowered to `llvm.memcpy` out of thread memory. Read in the AIR, not guessed.
+        //
+        // The bounds-checked input path (FC_mul_mm_bc_inp) is deliberately NOT prefetched: it
+        // cannot fire for this model -- ggml requires ne00 % blck_size == 0, so ne00 % 32 != 0 only
+        // happens for f16/f32/bf16 weights -- and its guard depends on loop_k, which the prefetch
+        // would have to re-derive. FC_mul_mm_bc_inp is a function constant, so each pipeline
+        // compiles exactly one of the two forms and the unused one costs nothing.
+        // The `= S1_2x4(0)` is not cosmetic. Without it the not-taken edge of the guard below
+        // carries the PREVIOUS iteration's value, so AIR puts four <4 x half> phis in the loop
+        // HEADER and the pair stays live across the MMA block -- 8 registers of pressure at exactly
+        // the point that killed MM-tile64. With it the merge sits inside the iteration and nothing
+        // is loop-carried. Read in the AIR both ways. Both stores are dead in either specialisation
+        // of the function constant, so this costs nothing at run time.
+        S1_2x4 temp_b0 = S1_2x4(0);
+        S1_2x4 temp_b1 = S1_2x4(0);
+
+        const short mmp_row0 = (tiitg/NL1);
+        const short mmp_row1 = (tiitg/NL1) + 32;
+
+        // clamp the SOURCE row the way lr1 does, so the second block cannot read outside
+        // the matrix; staged values beyond nr1 are discarded at the store either way.
+        const short mmp_rsrc0 = (mmp_row0 < nr1 ? mmp_row0 : (short)(nr1 - 1)) - lr1;
+        const short mmp_rsrc1 = (mmp_row1 < nr1 ? mmp_row1 : (short)(nr1 - 1)) - lr1;
+
+        if (FC_mul_mm_pipe && !FC_mul_mm_bc_inp) {
+            temp_b0 = (S1_2x4)(*((device T1_2x4 *) (y + mmp_rsrc0*ry)));
+            temp_b1 = (S1_2x4)(*((device T1_2x4 *) (y + mmp_rsrc1*ry)));
+        }
+
         // load data and store to threadgroup memory
         if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -11310,39 +11363,49 @@ kernel void kernel_mul_mm(
         // MM-tile32: NR1 = 64 stages 64 rows x 32 k of src1 = 2048 elements, but 128 threads x 8
         // elements only covers 1024, so each thread stages TWO row blocks 32 apart. Column
         // fragments per k-slice go 4 -> 8, hence ib = 8*sx + sy with sy in 0..7.
-        {
-            const int64_t ry = args.nb11/sizeof(T1);   // CRITIC-FIX: was `short` -> wrapped at k >= 32768
-
+        //
+        // MM-pipeline: in the !FC_mul_mm_bc_inp form the device loads moved to the top of this loop
+        // body and what is left here is a pure threadgroup store. Destination address formula and
+        // store order are byte-for-byte the ones shipped used. The bounds-checked form is shipped's,
+        // unchanged.
+        if (FC_mul_mm_bc_inp) {
             for (short jb = 0; jb < 2; ++jb) {
                 const short row = (tiitg/NL1) + 32*jb;
-                // clamp the SOURCE row the way lr1 does, so the second block cannot read outside
-                // the matrix; staged values beyond nr1 are discarded at the store either way.
                 const short rsrc = (row < nr1 ? row : (short)(nr1 - 1)) - lr1;
 
-                if (FC_mul_mm_bc_inp) {
-                    for (short i = 0; i < 8; ++i) {
-                        const short sx = (tiitg%NL1);
-                        const short sy = row/8;
-
-                        const short lx = i;
-                        const short ly = row%8;
-
-                        const short ib = 8*sx + sy;
-
-                        *(sb + 64*ib + 8*ly + lx) =
-                            (row < nr1 && loop_k + iy + i < args.ne00)
-                                ? (S1) *((device T1 *) (y + rsrc*ry) + i) : 0;
-                    }
-                } else {
+                for (short i = 0; i < 8; ++i) {
                     const short sx = (tiitg%NL1);
                     const short sy = row/8;
+
+                    const short lx = i;
                     const short ly = row%8;
 
                     const short ib = 8*sx + sy;
 
-                    *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) =
-                        (S1_2x4)(*((device T1_2x4 *) (y + rsrc*ry)));
+                    *(sb + 64*ib + 8*ly + lx) =
+                        (row < nr1 && loop_k + iy + i < args.ne00)
+                            ? (S1) *((device T1 *) (y + rsrc*ry) + i) : 0;
                 }
+            }
+        } else if (FC_mul_mm_pipe) {
+            const short sx = (tiitg%NL1);
+
+            *(threadgroup S1_2x4 *)(sb + 64*(8*sx + mmp_row0/8) + 8*(mmp_row0%8)) = temp_b0;
+            *(threadgroup S1_2x4 *)(sb + 64*(8*sx + mmp_row1/8) + 8*(mmp_row1%8)) = temp_b1;
+        } else {
+            // SHIPPED path, restored verbatim: device load AND threadgroup store, both below the
+            // WAR barrier. This is the control arm and it must stay byte-identical to what ships.
+            for (short jb = 0; jb < 2; ++jb) {
+                const short row  = (tiitg/NL1) + 32*jb;
+                const short rsrc = (row < nr1 ? row : (short)(nr1 - 1)) - lr1;
+
+                const short sx = (tiitg%NL1);
+                const short sy = row/8;
+                const short ly = row%8;
+                const short ib = 8*sx + sy;
+
+                *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) =
+                    (S1_2x4)(*((device T1_2x4 *) (y + rsrc*ry)));
             }
         }
 

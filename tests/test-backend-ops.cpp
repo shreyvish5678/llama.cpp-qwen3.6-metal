@@ -9016,6 +9016,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 5120, {1, 1}, {1, 1}));
         }
     }
+    // MM-tile64: the Metal mul_mm output tile. Its bounds-checked epilogue runs whenever ne0 or ne1
+    // falls off the tile, and the stock eval list reaches mul_mm (n > 8) only at n = 9, 16 and 32,
+    // all at m = 16 or 2880 - so it never covers a full tile and never covers the column boundary.
+    // Both sides of every tile edge, on the types this project's model uses.
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        // column edges: mul_mm starts at n = 9; 64/128/256 are tile and half-tile widths
+        for (int64_t n : {9, 16, 63, 64, 65, 127, 128, 129, 255, 256, 257}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, n, 256, {1, 1}, {1, 1}));
+        }
+        // row edges, held at a column count that is itself a partial tile.
+        // m stays a multiple of 4: the epilogue copies out with `device float4 *`, which needs
+        // ne0 % 4 == 0 to be aligned. That is an upstream assumption, older than this change and
+        // untouched by it, so these cases deliberately do not probe it - they isolate the tile.
+        for (int64_t m : {60, 64, 68, 124, 132, 256}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 129, 256, {1, 1}, {1, 1}));
+        }
+    }
+    // k not a multiple of 32 takes the bc_inp staging path, which f16 can express and K-quants cannot
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 132, 129, 260, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 256, 260, {1, 1}, {1, 1}));
+    // batched, so the im offset in both output paths is exercised too
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 129, 256, {2, 2}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 256, 256, {2, 2}, {1, 1}));
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
