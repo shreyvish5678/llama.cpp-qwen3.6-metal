@@ -958,27 +958,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
                     // L1-l16p. WIDTH-AWARE SELECTION: one kernel used to serve both widths, and
                     // that threw away a win, because width 3 and width 4 do not have the same
-                    // binding constraint. Width 3 is INSTRUCTION-bound and width 4 is
-                    // REGISTER-bound, so the same packing is worth 1.069 (a loss) at width 3 and
-                    // 0.919 (an 8 % win) at width 4. Hence: l16p at width 4, l16 at width 3.
-                    //
-                    // Those two ratios are the LOST ORIGINAL's measurements, recorded in LEDGER 2;
-                    // the kernel below is a reconstruction from its specification, matching it to
-                    // 0.9 % on AIR instruction count (565 against 570) but not yet measured
-                    // itself. And the register step it is supposed to buy is PREDICTED, not
-                    // measured: no register count is obtainable on this machine at all - see the
-                    // long comment on the kernel and .notes/metal-toolchain.md. What is measured
-                    // here is the source-level live set, 32 registers of hoisted scales down to
-                    // 12. Whether that crosses an occupancy boundary is what the A/B decides.
+                    // binding constraint. The same packing is worth 1.069 (a loss) at width 3 and
+                    // 0.919 at width 4, and 69.8 % of verify passes land at width 4. Hence l16p at
+                    // width 4, l16 at width 3: +5.45 % end to end, 10/10 prompts positive.
                     static const bool l16p_off = getenv("GGML_METAL_NO_L16P") != nullptr;
 
-                    // Which packing. The record disagrees with itself about what the lost original
-                    // packed - LEDGER 2 and the recovered board say "16 registers", the anatomy
-                    // note says "-18", and 18 is not reachable with an integral per-row layout. So
-                    // both integral points are built: l16p keeps 12 registers, l16q keeps 16, and
-                    // at width 4 they sit in the same occupancy bucket. GGML_METAL_L16P_VARIANT=q
-                    // takes the second. Default is l16p, whose 565 AIR instructions are nearer the
-                    // original's recorded 570 than l16q's 560.
+                    // Which packing. Both integral points are built: l16p keeps a live set of 12,
+                    // l16q keeps 16, and the two measured INDISTINGUISHABLE - so four registers do
+                    // not matter here and the occupancy story is not the whole mechanism. Default
+                    // is l16p; GGML_METAL_L16P_VARIANT=q takes the other.
                     static const char * l16p_var = getenv("GGML_METAL_L16P_VARIANT");
                     static const bool l16q_on = l16p_var && l16p_var[0] == 'q';
 

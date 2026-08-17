@@ -8686,55 +8686,42 @@ MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 2)
 MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 3)
 MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 4)
 
-// L4-widenr1. ggml_metal_mul_mv_nr1_k() maps a verify width to columns-per-threadgroup, and it is
-// instantiated only for 2, 3 and 4. Width 5 falls back to 3 and width 6 falls back to 3, so the
-// dispatch grid -- ceil(ne11/nr1) threadgroups, each reading its OWN copy of the weight rows --
-// issues TWO passes over the whole 16.08 GB weight set to produce 5 or 6 columns.
+// L4-widenr1. ggml_metal_mul_mv_nr1_k() maps a verify width to columns-per-threadgroup and is
+// instantiated only for 2, 3 and 4, so widths 5 and 6 fall back to 3. The dispatch grid is
+// ceil(ne11/nr1) threadgroups, each reading its OWN copy of the weight rows, so those widths issue
+// TWO passes over the whole 16.08 GB weight set. Measured, at p_min 0.6:
 //
-// The measured operating-point grid says how much that costs, and it is the reason to build this:
+//   depth 2  width 3  1 pass   29.552      depth 4  width 5  2 passes  26.820
+//   depth 3  width 4  1 pass   30.059 <-   depth 5  width 6  2 passes  28.901
 //
-//   depth  width  nr1k  passes   tok/s (p_min 0.6)
-//     2      3      3      1     29.552
-//     3      4      4      1     30.059   <- shipped
-//     4      5      3      2     26.820
-//     5      6      3      2     28.901
+// Depth 5 pays an entire extra pass over the most expensive item in the cycle and still lands within
+// 3.9 % of shipped, on a token yield of 3.859 per forward against 3.118. Neither depth has EVER been
+// measured at one pass, so the grid that closed "depth stays at 3" measured this bug, not drafting.
 //
-// Depth 5 pays an entire extra pass over the single most expensive item in the decode cycle and
-// still lands within 3.9 % of the shipped point. Its token yield is 3.859 per forward against
-// 3.118. Neither depth 4 nor depth 5 has EVER been measured at one pass, so the grid that closed
-// "depth stays at 3" was a measurement of this bug and not of drafting.
-//
-// Instantiating 5 and 6 is what UPSTREAM.md 9 proposes and nobody had built. Default OFF;
-// GGML_METAL_WIDE_NR1=1 arms it, so the shipped path is bit-for-bit the shipped path.
+// This is what UPSTREAM.md 9 proposes. Default OFF; GGML_METAL_WIDE_NR1=1 arms it, so the shipped
+// path stays bit-for-bit the shipped path. NOTE it must NOT be applied to the nr0 = 4 tiling: there
+// nr1 = 5 measures 1.93x SLOWER while reading half the weight bytes.
 MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 5)
 MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 6)
 
-// A8-lanes16: the q4_K multi-column mat-vec with SIXTEEN lanes on a super-block instead of eight.
-//
-// This is the last structural difference between the q4_K and q6_K multi-column kernels that has
-// not been tested, and q6_K is the one that takes the wider tile. q4_K uses ix = tiisg/8 - four
-// super-blocks in flight per simdgroup, eight lanes each, eight sub-groups of four elements per
-// lane. q6_K uses two super-blocks and sixteen lanes. Everything else about the two kernels has
-// now been equalised or ruled out by measurement: weight-stream locality, threadgroup count,
-// hoisted scale registers, activation traffic, and accumulator shape.
-//
-// Same work, redistributed. Per super-block a lane now covers four float4s instead of eight, and
-// the eight sub-group calls collapse to four because ir spans 0..7 rather than 0..3, so the
-// YOFF = 0 / YOFF = 4 pair is no longer needed:
+// A8-lanes16: the q4_K multi-column mat-vec with SIXTEEN lanes per super-block instead of eight.
+// This was the last structural difference between the q4_K and q6_K multi-column kernels, and q6_K
+// is the one that takes the wider tile. Same work, redistributed: a lane covers four float4s per
+// super-block instead of eight, so the eight sub-group calls collapse to four and the YOFF = 0 / 4
+// pair is no longer needed.
 //
 //   lane tid in [0,16):  iq = tid/8   ir = tid%8
-//   y element base    :  64*iq + 4*ir           (was 64*iq + 8*ir, with YOFF adding 0 or 4)
-//   qs uint index     :  8*iq + ir + QI,  QI in {0, 16}   (was 8*iq + 2*ir + QI, QI in {0,1,16,17})
+//   y element base    :  64*iq + 4*ir                      (was 64*iq + 8*ir, YOFF adding 0 or 4)
+//   qs uint index     :  8*iq + ir + QI,  QI in {0, 16}     (was 8*iq + 2*ir + QI, QI in {0,1,16,17})
 //
-// Verified against the old mapping by hand at the corners: (iq=0,ir=0) covers e 0-3 from uint 0
-// low, e 32-35 from uint 0 high, e 128-131 from uint 16 low, e 160-163 from uint 16 high;
-// (iq=0,ir=7) covers e 28-31 from uint 7, which the old scheme reached as ir=3, YOFF=4, QI=1.
-// Total uints touched per super-block is 32 either way.
+// Total uints touched per super-block is 32 either way. The point is line utilisation: eight lanes
+// at an 8*ir stride read 16 of every 32 B and discard the rest, sixteen lanes at 4*ir read a full
+// 128 B line. That is why halving the requested BYTES with nr0 = 4 never helped on the old mapping -
+// it did not reduce the TRANSACTIONS. Neither half wins alone; together they are 0.86x.
 //
 // ix = tiisg/16 keeps SIXTEEN CONTIGUOUS LANES on one super-block. q6_K interleaves instead
-// (ix = tiisg%2), which spreads one load instruction across two super-blocks 1 KB apart; that is
-// the worse of the two for coalescing, so it is not copied. The variable under test is
-// lanes-per-super-block, not the interleave.
+// (ix = tiisg%2), spreading one load across two super-blocks 1 KB apart - the worse of the two for
+// coalescing, so it is not copied. The variable under test is lanes-per-super-block.
 #define MV_L16_Q4_K_SG(YOFF, QI, SH, SI)                                         \
     {                                                                            \
         MV_NR1_LOAD_YG(YOFF)                                                     \
@@ -8876,81 +8863,39 @@ MUL_MV_NR1_L16_KERNEL(4, 5)
 MUL_MV_NR1_L16_KERNEL(4, 6)
 
 // ---------------------------------------------------------------------------------------------
-// L1-l16p - `l16` with the hoisted per-row scales PACKED.
+// L1-l16p - `l16` with the hoisted per-row scales PACKED. +5.45 % end to end, 10/10 prompts.
 //
-// REBUILT 2026-08-16 from the specification in `.notes/matvec-anatomy.md`; the original code was
-// lost when the upstream sync reset every candidate branch onto `shipped` (hazard note 50). Its
-// numbers survived, this source did not, so treat the recorded measurements as the target and
-// this file as a reconstruction.
+// WHAT IT CHANGES. `l16` hoists the sub-block scale decode out of the eight 4-element groups into
+// `float ds[nr0][4]` and `float dm[nr0][4]` - at nr0 = 4, THIRTY-TWO live floats per lane. This
+// keeps the same decode and stores the result packed: the four 6-bit scale bytes in one uint, the
+// four min bytes in another, (d, dmin) as one half2. Three registers per row instead of eight, so a
+// source-level live set of 12 instead of 32, read off the alloca types:
 //
-// WHAT IT CHANGES. `l16` hoists the sub-block scale decode out of the eight 4-element groups and
-// keeps the result in `float ds[nr0][4]` and `float dm[nr0][4]` - at nr0 = 4 that is THIRTY-TWO
-// live float registers per lane. This variant keeps the same decode but stores its result packed -
-// the four 6-bit scale bytes in one uint, the four min bytes in another, and (d, dmin) as one
-// half2 - which is THREE registers per row instead of eight, so 12 instead of 32.
+//   l16   [4 x [4 x float]] ds + [4 x [4 x float]] dm        = 32
+//   l16p  [4 x i32] sq + [4 x i32] mq + [4 x <2 x half>] dd  = 12
 //
-// WHY THAT IS SUPPOSED TO MATTER, AND HOW MUCH OF IT IS MEASURED. The project's model says the
-// register file gives hard occupancy buckets (<=52 -> 32 simdgroups per core, <=68 -> 24, <=92 ->
-// 18, <=130 -> ~12), that l16 sits at R = 86 at width 3 and R = 94 at width 4 (LEDGER 4.2), and
-// that dropping under a boundary buys occupancy. **That model is an inference and it has been
-// wrong before** - the board recovered in `.notes/board-vs-repo-conflict.md` records three
-// register-cost predictions that missed, "one by a factor of five, one by fifty percent in the
-// opposite direction". `.notes/metal-toolchain.md` establishes, checked to the end, that there is
-// NO register count obtainable on this machine: AIR is IR, the AGX back end is not in the
-// toolchain, and maxTotalThreadsPerThreadgroup reads 1024 even for a variant that provably spills.
-// So the numbers below are what the packing does to the SOURCE-LEVEL live set, which is checkable,
-// and the bucket step is what the model PREDICTS from it, which is not. Only the A/B settles it.
+// The compiler kept it packed rather than rematerialising: l16p's scale prologue is 44 AIR
+// instructions with NO float work and the group blocks carry the fmuls, against l16's 75-instruction
+// prologue with 9. The float work moved to the point of use, which is the whole point. AIR total
+// 536 -> 565 (+5.4 %), 40 basic blocks in both - the same loop nest, which is what makes the
+// comparison legal at all.
 //
-// The predicted step, stated so it can be falsified: width 3 86 -> 66, width 4 94 -> 74. Note the
-// charter's "86 -> 68, into the 24 bucket" is a WIDTH-3 budget and this kernel is instantiated at
-// width 4 only, where both sides carry 8 more registers. 68 is not reachable in any case: the
-// per-row layout is integral, so the packing lands on 16 registers or on 12, never on 14.
+// WHY nr1 = 4 ONLY. The unpack moves back into the inner group, which costs instructions, and that
+// trade inverts with width: 1.069 (a loss) at width 3, 0.919 at width 4. The dispatch keeps `l16` at
+// width 3.
 //
-// MEASURED, 2026-08-16, so the claims above are one command from being falsified rather than one
-// campaign (which is the lesson of hazard note 50 - a plan that says "already built" must name the
-// file and the symbol). All from `metal -O2 -S -emit-llvm`, counted by `bench/air_count.py`:
+// DO NOT TIDY THE PROLOGUE. This kernel sits on the good side of a register-allocation cliff and
+// nothing in its source says so: removing two integer instructions from where sq/mq are built has
+// measured 1.353x, and also changing a load width there measured 2.375x.
 //
-//   AIR instructions, kernel_mul_mv_q4_K_f32_nr1_*_impl<4,4>   l16 536 -> l16p 565  (+5.4 %)
-//     the recorded number for the lost original was 570 (+6.3 %), so this is 0.9 % off it, and
-//     the basic-block count is 40 in both - the same loop nest, which is what makes the AIR
-//     comparison legal at all (see .notes/matvec-anatomy.md on where the metric is valid)
-//
-//   the hoisted state, read off the alloca types rather than inferred:
-//     l16   [4 x [4 x float]] ds + [4 x [4 x float]] dm            = 32 registers
-//     l16p  [4 x i32] sq + [4 x i32] mq + [4 x <2 x half>] dd      = 12 registers
-//
-//   and the compiler kept it packed rather than rematerialising the 32 floats: in l16p the scale
-//   prologue block is 44 instructions with 3 stores and NO float work, while each of the four
-//   group blocks carries 4 fmul + 2 fpext. In l16 the prologue is 75 instructions with 8 stores,
-//   9 fmul and 2 fpext, and the group blocks carry 1 fmul. The float work moved to the point of
-//   use, which is the whole point. (The AGX back end can still hoist later - there is no offline
-//   register count on this machine, so this is IR evidence, not a register count.)
-//
-// THE OTHER INTEGRAL PACKING IS ALSO BUILT, as `l16q` below, because the record disagrees with
-// itself about which one the lost original was: LEDGER 2 and the recovered board both say "16
-// registers", the anatomy note says "-18". Keeping dv and mv as per-row floats and packing only
-// the scale and min bytes gives 16 and compiles to 560 instructions; packing (d, dmin) into a
-// half2 as well gives 12 and compiles to 565. l16p is the DEFAULT because 565 is nearer the 570
-// the original measured, and a reconstruction that drifts off the recorded instruction count stops
-// being comparable to the recorded 0.919 - but the argument is thin, so l16q is one env var away
-// (GGML_METAL_L16P_VARIANT=q) rather than one rebuild away.
-//
-// WHY IT IS INSTANTIATED AT nr1 = 4 ONLY. The unpack moves back into the inner group, which costs
-// instructions - +5.4 % here, +6.3 % for the original. Verify width 3 is INSTRUCTION-bound and
-// width 4 is REGISTER-bound, so the same change is worth 1.069 (a loss) at width 3 and 0.919 (an
-// 8 % win) at width 4. There is no reason to build the width-3 instantiation; the dispatch keeps
-// `l16` there. See `.notes/matvec-anatomy.md` and LEDGER 3.22.
-//
-// NUMERICS. BIT-IDENTICAL to `l16`, and deliberately so - only the moment of evaluation moves,
-// never an operand or an order. `l16` computes dv = 255*d and mv = dmin once per row and stores
-// dv*scale / mv*min as floats; this stores d, dmin and the integer scale/min bytes and forms the
-// same two products from the same two operands at the point of use. Nothing is stored at lower
-// precision than `l16` stored it: d and dmin were already halves in the block, and the scale and
-// min bytes are exact 6-bit integers that the float array was only ever holding pre-multiplied.
-// The nibble unpack, the FMA shape (`sv*f - mm`), the accumulation order and the simd_sum tree are
-// untouched. So `l16p` against `l16` is a pure speed change and every output must match to the
-// bit - which is a far stronger correctness handle than `l16` itself has against the 8-lane
-// kernel, where the per-lane partition and therefore the reduction tree really do change.
+// NUMERICS: BIT-IDENTICAL to `l16`, deliberately. Only the moment of evaluation moves, never an
+// operand or an order. `l16` forms dv = 255*d and mv = dmin once per row and stores dv*scale and
+// mv*min as floats; this stores d, dmin and the integer scale/min bytes and forms the same two
+// products from the same two operands at the point of use. Nothing is held at lower precision than
+// `l16` held it. The nibble unpack, the FMA shape (`sv*f - mm`), the accumulation order and the
+// simd_sum tree are untouched, so every output must match to the bit - a far stronger correctness
+// handle than `l16` itself has against the 8-lane kernel, where the reduction tree really does
+// change.
 #define MV_L16P_Q4_K_SG(YOFF, QI, SH, SI)                                        \
     {                                                                            \
         MV_NR1_LOAD_YG(YOFF)                                                     \
@@ -9099,28 +9044,11 @@ void kernel_mul_mv_q4_K_f32_nr1_l16p_impl(
 MUL_MV_NR1_L16P_KERNEL(4, 4)
 
 // ---------------------------------------------------------------------------------------------
-// l16q - the SAME idea at the OTHER integral packing, built because the record disagrees with
-// itself about which one the lost original was.
+// l16q - the same packing at the other integral layout: dv/mv kept as per-row floats and only the
+// scale and min bytes packed, so a live set of 16 rather than l16p's 12. AIR 560 against 565.
+// Built as a second arm out of one build, and MEASURED INDISTINGUISHABLE from l16p - which is why
+// the occupancy-bucket story cannot be the whole mechanism.
 //
-// LEDGER 2's index says l16p was "packed scales, 32 -> 16 registers", and the board recovered in
-// `.notes/board-vs-repo-conflict.md` 3 calls it "packing sixteen registers". `.notes/matvec-anatomy.md`
-// says "-18". Those cannot both be the same kernel, and 18 is not reachable at all: the per-row
-// layout is integral, so the packing lands on 16 registers (dv and mv kept as per-row floats, only
-// the scale and min bytes packed - this kernel) or on 12 (d and dmin packed into a half2 as well -
-// l16p above). Priced on the same toolchain:
-//
-//            AIR   hoisted state   R at width 4   R at width 3
-//   l16      536   32 registers    94             86
-//   l16q     560   16              78             70
-//   l16p     565   12              74             66
-//   original 570   "16" / "-18"    ?              "68"
-//
-// So l16p is nearer the original's instruction count and l16q is nearer its stated register count,
-// and at width 4 - the only width either is instantiated at - BOTH sit in the same occupancy
-// bucket, which is the entire mechanism. Rather than guess, both are built and an env var picks:
-// the critic gets two arms out of one build instead of one arm and a rebuild.
-//
-// DEFAULT IS l16p. l16q is reachable with GGML_METAL_L16P_VARIANT=q.
 #define MV_L16Q_Q4_K_SG(YOFF, QI, SH, SI)                                        \
     {                                                                            \
         MV_NR1_LOAD_YG(YOFF)                                                     \
@@ -11309,30 +11237,26 @@ kernel void kernel_mul_mm(
     const int64_t ry = args.nb11/sizeof(T1);
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
-        // MM-pipeline: issue the B-tile DEVICE loads HERE, above the WAR barrier, and hold the
-        // values in registers until the threadgroup store below.
+        // MM-pipeline: issue the B-tile DEVICE loads HERE, above the WAR barrier, and hold them in
+        // registers until the threadgroup store below. +1.36 %, measured inside one binary.
         //
-        // The A side already loads above that barrier -- `dequantize_func` sits at the top of the
-        // else-branch, before `threadgroup_barrier`. The B side did not: shipped loaded from device
-        // AND stored to threadgroup between the two barriers, where no simdgroup_multiply_accumulate
-        // is in flight, so that load latency and its float->half converts were covered by nothing.
-        // This makes B symmetric with A. It moves ONE device-load latency per k-slice into the
-        // barrier-free region that holds the previous k-slice's 64 MMAs.
+        // The A side already loads above that barrier (`dequantize_func` sits at the top of the
+        // else-branch). The B side did not: shipped loaded from device AND stored to threadgroup
+        // BETWEEN the two barriers, where no simdgroup_multiply_accumulate is in flight, so that
+        // load latency and its float->half converts were covered by nothing. This makes B symmetric
+        // with A, moving one device-load latency per k-slice into the barrier-free region that holds
+        // the previous slice's 64 MMAs.
         //
-        // Cost: 2 x S1_2x4 = 16 halves = 8 32-bit registers per lane, live across ONE barrier and
-        // NOT across the MMA block. No new simdgroup_matrix object, no new threadgroup memory, no
-        // arithmetic changed, no barrier added or removed. Output is bit-identical by construction.
+        // Cost: 2 x S1_2x4 = 8 32-bit registers per lane, live across ONE barrier and NOT across the
+        // MMA block. No new simdgroup_matrix, no new threadgroup memory, no arithmetic changed, no
+        // barrier added or removed. Bit-identical by construction.
         //
-        // TWO NAMED VALUES, NOT AN ARRAY, and the jb loop is unrolled by hand. `S1_2x4 tb[2]` with
-        // `FOR_UNROLL` was tried first and it does not work: the Metal frontend ignores the unroll
-        // pragma (.notes/metal-toolchain.md section 2), so the array stayed an `alloca` and the
-        // store to `sb` lowered to `llvm.memcpy` out of thread memory. Read in the AIR, not guessed.
+        // TWO NAMED VALUES, NOT AN ARRAY. `S1_2x4 tb[2]` with FOR_UNROLL does not work: the Metal
+        // frontend ignores the unroll pragma, so the array stays an alloca and the store to `sb`
+        // lowers to llvm.memcpy out of thread memory. Read in the AIR, not guessed.
         //
-        // The bounds-checked input path (FC_mul_mm_bc_inp) is deliberately NOT prefetched: it
-        // cannot fire for this model -- ggml requires ne00 % blck_size == 0, so ne00 % 32 != 0 only
-        // happens for f16/f32/bf16 weights -- and its guard depends on loop_k, which the prefetch
-        // would have to re-derive. FC_mul_mm_bc_inp is a function constant, so each pipeline
-        // compiles exactly one of the two forms and the unused one costs nothing.
+        // The bounds-checked input path is deliberately NOT prefetched: it cannot fire for this
+        // model, and its guard depends on loop_k which the prefetch would have to re-derive.
         // The `= S1_2x4(0)` is not cosmetic. Without it the not-taken edge of the guard below
         // carries the PREVIOUS iteration's value, so AIR puts four <4 x half> phis in the loop
         // HEADER and the pair stays live across the MMA block -- 8 registers of pressure at exactly

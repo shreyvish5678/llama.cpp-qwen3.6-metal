@@ -1,7 +1,7 @@
 # llama.cpp — Metal tuning for Qwen3.8-27B on an M4 Max
 
 A fork carrying Metal-backend changes aimed at one model on one machine: **Qwen3.8-27B (Q4_K_M) on
-a binned 32-core M4 Max, 410 GB/s, 36 GB unified**. Branch `shipped` is the tuned stack; `master`
+a binned 32-core M4 Max, 369 GB/s measured, 36 GB unified**. Branch `shipped` is the tuned stack; `master`
 tracks upstream `ggml-org/llama.cpp` and is kept in sync so the diff stays readable. Synced through
 **`89e0aa6fd`**.
 
@@ -51,12 +51,27 @@ before it goes upstream.
 seven of the ten frozen prompts. That is a property of the design, not a regression; "Known limits"
 item 2 explains the mechanism. It was 9/10 on Qwen3.6 at depths 2 and 3.
 
-**The physics.** Unspeculated decode at one token per forward pass cannot exceed **25.48 tok/s**:
-410 GB/s over a 16.0911 GB read. Both GGUFs hold byte-identical tensor data, so that ceiling did not
-move with the model. All remaining decode headroom is speculative. On prefill, the scalar roof was
-**measured** at 12.100 TFLOP/s pure FP32 — **there is no matrix unit on M4**, `matmul2d` lowers onto
-the ordinary shader path — and prefill sits at **81.9 %** of it. An earlier version of this file
-divided by a *derived* 12.93 TFLOP/s and reported ~77 %; the measured roof is the one to use.
+**The physics, and both roofs came in under their derivations.**
+
+- **The bus is 369.3 GB/s measured, against 409.6 derived** (`8533 × 384 / 8`). Every decode ceiling
+  in this fork's history divided by the derived figure.
+- **A decode pass is not pure streaming.** It is **43.15 ms of weight reading** — fixed at any batch
+  width, and 99 % of the measured roof — plus **11.99 ms per verify column**, which runs at 97 % of a
+  dequantising arithmetic floor of 5.30 TFLOP/s. So one token per pass costs 53.94 ms and the wall is
+  **18.54 tok/s**, not the 25.48 an earlier version of this file reported. **Unspeculated decode
+  measures 18.350 — 99 % of its wall, not 72 % of an imagined one.**
+- **The closed form that follows** is the most useful number here:
+  `ms/token = 43.15 / tokens_per_forward + 11.99`. It predicts unspeculated decode at 18.14 against
+  18.350 measured **without ever being fitted to it**, and puts the ceiling at infinite verify width
+  at **83.4 tok/s** — of which today's 33.137 is 40 %.
+- **On prefill there is no matrix unit on M4** (`matmul2d` lowers onto the ordinary shader path), so
+  the ceiling is the scalar roof, **measured** at 12.100 TFLOP/s pure FP32. Against a probe built to
+  match this kernel in every binding ratio, prefill sits at **95 %**.
+
+**So the remaining distance is tokens per forward — the draft model's acceptance — and not a Metal
+kernel.** One more draft depth costs a draft step plus a verify column, about 16 ms, and pays back one
+token only if accepted: break-even is 53 % marginal acceptance against a measured 15 %. That is why
+three separate mechanisms here each bought more tokens per pass and each lost throughput.
 
 **On MLX.** The nearest comparable engine read 148.2 tok/s prefill and 21.4 tok/s unspeculated decode
 on this machine — but that was measured on **2026-08-08, on Qwen3.6, on the mis-built binary

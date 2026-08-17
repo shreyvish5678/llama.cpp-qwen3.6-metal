@@ -1,8 +1,9 @@
 > **This is a fork.** Metal-backend tuning for Qwen3.8-27B (Q4_K_M) on a 32-core Apple M4 Max:
-> prefill **203.4 tok/s**, decode **33.1 tok/s** with speculation against a **25.5 tok/s** bandwidth
-> ceiling at one token per forward pass. Both figures were read off one run, not composed from
-> ratios. Shipping now: packed q4_K scales at verify width 4, a software-pipelined `mul_mm` K loop,
-> and an FR-Spec draft vocabulary. Three things here are worth upstreaming on their own: a
+> prefill **203.4 tok/s**, decode **33.1 tok/s** with speculation against an **18.5 tok/s** wall at
+> one token per forward pass (369 GB/s measured, plus the dequantisation arithmetic — unspeculated
+> decode is at 99 % of it). Both figures were read off one run, not composed from ratios. Shipping
+> now: packed q4_K scales at verify width 4, a software-pipelined `mul_mm` K loop, and an FR-Spec
+> draft vocabulary. Three things here are worth upstreaming on their own: a
 > `dequantize_q4_K` scale that goes subnormal for 99.9998 % of blocks on every Q4_K model, a
 > `test-backend-ops` coverage gap that let four tile-geometry bugs pass a green suite, and
 > `ggml_metal_mul_mv_nr1_k(5) = 3`, which makes a five-column verify pass stream the whole weight set
