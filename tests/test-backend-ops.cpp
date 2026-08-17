@@ -9005,6 +9005,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
+    // K-quant mat-vec at a WIDE output. Every other K-quant mat-vec case above is m = 16, and the
+    // Metal backend selects a different kernel above m = 4096: the multi-column q4_K and q6_K
+    // variants are gated on ne01, so at m = 16 the gate is never taken and a suite that passes
+    // with the gate on and off has run the SAME code twice. That happened, and the result was
+    // quoted as proof of bit-exactness. n sweeps 1..8 because the column count picks the kernel
+    // too - q4_K takes l16 at n = 3 and the packed-scale l16p at n = 4.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n = 1; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));

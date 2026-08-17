@@ -8849,6 +8849,392 @@ MUL_MV_NR1_L16_KERNEL(4, 2)
 MUL_MV_NR1_L16_KERNEL(4, 3)
 MUL_MV_NR1_L16_KERNEL(4, 4)
 
+// ---------------------------------------------------------------------------------------------
+// L1-l16p - `l16` with the hoisted per-row scales PACKED.
+//
+// REBUILT 2026-08-16 from the specification in `.notes/matvec-anatomy.md`; the original code was
+// lost when the upstream sync reset every candidate branch onto `shipped` (hazard note 50). Its
+// numbers survived, this source did not, so treat the recorded measurements as the target and
+// this file as a reconstruction.
+//
+// WHAT IT CHANGES. `l16` hoists the sub-block scale decode out of the eight 4-element groups and
+// keeps the result in `float ds[nr0][4]` and `float dm[nr0][4]` - at nr0 = 4 that is THIRTY-TWO
+// live float registers per lane. This variant keeps the same decode but stores its result packed -
+// the four 6-bit scale bytes in one uint, the four min bytes in another, and (d, dmin) as one
+// half2 - which is THREE registers per row instead of eight, so 12 instead of 32.
+//
+// WHY THAT IS SUPPOSED TO MATTER, AND HOW MUCH OF IT IS MEASURED. The project's model says the
+// register file gives hard occupancy buckets (<=52 -> 32 simdgroups per core, <=68 -> 24, <=92 ->
+// 18, <=130 -> ~12), that l16 sits at R = 86 at width 3 and R = 94 at width 4 (LEDGER 4.2), and
+// that dropping under a boundary buys occupancy. **That model is an inference and it has been
+// wrong before** - the board recovered in `.notes/board-vs-repo-conflict.md` records three
+// register-cost predictions that missed, "one by a factor of five, one by fifty percent in the
+// opposite direction". `.notes/metal-toolchain.md` establishes, checked to the end, that there is
+// NO register count obtainable on this machine: AIR is IR, the AGX back end is not in the
+// toolchain, and maxTotalThreadsPerThreadgroup reads 1024 even for a variant that provably spills.
+// So the numbers below are what the packing does to the SOURCE-LEVEL live set, which is checkable,
+// and the bucket step is what the model PREDICTS from it, which is not. Only the A/B settles it.
+//
+// The predicted step, stated so it can be falsified: width 3 86 -> 66, width 4 94 -> 74. Note the
+// charter's "86 -> 68, into the 24 bucket" is a WIDTH-3 budget and this kernel is instantiated at
+// width 4 only, where both sides carry 8 more registers. 68 is not reachable in any case: the
+// per-row layout is integral, so the packing lands on 16 registers or on 12, never on 14.
+//
+// MEASURED, 2026-08-16, so the claims above are one command from being falsified rather than one
+// campaign (which is the lesson of hazard note 50 - a plan that says "already built" must name the
+// file and the symbol). All from `metal -O2 -S -emit-llvm`, counted by `bench/air_count.py`:
+//
+//   AIR instructions, kernel_mul_mv_q4_K_f32_nr1_*_impl<4,4>   l16 536 -> l16p 565  (+5.4 %)
+//     the recorded number for the lost original was 570 (+6.3 %), so this is 0.9 % off it, and
+//     the basic-block count is 40 in both - the same loop nest, which is what makes the AIR
+//     comparison legal at all (see .notes/matvec-anatomy.md on where the metric is valid)
+//
+//   the hoisted state, read off the alloca types rather than inferred:
+//     l16   [4 x [4 x float]] ds + [4 x [4 x float]] dm            = 32 registers
+//     l16p  [4 x i32] sq + [4 x i32] mq + [4 x <2 x half>] dd      = 12 registers
+//
+//   and the compiler kept it packed rather than rematerialising the 32 floats: in l16p the scale
+//   prologue block is 44 instructions with 3 stores and NO float work, while each of the four
+//   group blocks carries 4 fmul + 2 fpext. In l16 the prologue is 75 instructions with 8 stores,
+//   9 fmul and 2 fpext, and the group blocks carry 1 fmul. The float work moved to the point of
+//   use, which is the whole point. (The AGX back end can still hoist later - there is no offline
+//   register count on this machine, so this is IR evidence, not a register count.)
+//
+// THE OTHER INTEGRAL PACKING IS ALSO BUILT, as `l16q` below, because the record disagrees with
+// itself about which one the lost original was: LEDGER 2 and the recovered board both say "16
+// registers", the anatomy note says "-18". Keeping dv and mv as per-row floats and packing only
+// the scale and min bytes gives 16 and compiles to 560 instructions; packing (d, dmin) into a
+// half2 as well gives 12 and compiles to 565. l16p is the DEFAULT because 565 is nearer the 570
+// the original measured, and a reconstruction that drifts off the recorded instruction count stops
+// being comparable to the recorded 0.919 - but the argument is thin, so l16q is one env var away
+// (GGML_METAL_L16P_VARIANT=q) rather than one rebuild away.
+//
+// WHY IT IS INSTANTIATED AT nr1 = 4 ONLY. The unpack moves back into the inner group, which costs
+// instructions - +5.4 % here, +6.3 % for the original. Verify width 3 is INSTRUCTION-bound and
+// width 4 is REGISTER-bound, so the same change is worth 1.069 (a loss) at width 3 and 0.919 (an
+// 8 % win) at width 4. There is no reason to build the width-3 instantiation; the dispatch keeps
+// `l16` there. See `.notes/matvec-anatomy.md` and LEDGER 3.22.
+//
+// NUMERICS. BIT-IDENTICAL to `l16`, and deliberately so - only the moment of evaluation moves,
+// never an operand or an order. `l16` computes dv = 255*d and mv = dmin once per row and stores
+// dv*scale / mv*min as floats; this stores d, dmin and the integer scale/min bytes and forms the
+// same two products from the same two operands at the point of use. Nothing is stored at lower
+// precision than `l16` stored it: d and dmin were already halves in the block, and the scale and
+// min bytes are exact 6-bit integers that the float array was only ever holding pre-multiplied.
+// The nibble unpack, the FMA shape (`sv*f - mm`), the accumulation order and the simd_sum tree are
+// untouched. So `l16p` against `l16` is a pure speed change and every output must match to the
+// bit - which is a far stronger correctness handle than `l16` itself has against the 8-lane
+// kernel, where the per-lane partition and therefore the reduction tree really do change.
+#define MV_L16P_Q4_K_SG(YOFF, QI, SH, SI)                                        \
+    {                                                                            \
+        MV_NR1_LOAD_YG(YOFF)                                                     \
+                                                                                 \
+        device const uint * qp = qb + (QI);                                      \
+                                                                                 \
+        FOR_UNROLL (short row = 0; row < nr0; ++row) {                           \
+            const float4 f = unpack_unorm4x8_to_float((qp[0] >> (SH)) & 0x0F0F0F0F); \
+                                                                                 \
+            const float dv = 255.f*(float) dd[row][0];                           \
+            const float mv =        (float) dd[row][1];                          \
+                                                                                 \
+            const float sv = dv*(float)((sq[row] >> (8*(SI))) & 0xFFu);          \
+            const float mm = mv*(float)((mq[row] >> (8*(SI))) & 0xFFu);          \
+                                                                                 \
+            const float4 w = sv*f - mm;                                          \
+                                                                                 \
+            FOR_UNROLL (short c = 0; c < nr1; ++c) {                             \
+                sumf[row][c] += dot(w, yg[c]);                                   \
+            }                                                                    \
+                                                                                 \
+            qp += sr4;                                                           \
+        }                                                                        \
+    }
+
+template<int nr0, int nr1, typename args_t>
+void kernel_mul_mv_q4_K_f32_nr1_l16p_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const short ix  = tiisg/16;   // 0 or 1  -> two super-blocks in flight
+    const short tid = tiisg%16;   // 0..15   -> sixteen lanes on each
+    const short iq  = tid/8;      // 0 or 1
+    const short ir  = tid%8;      // 0..7
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y*nr1;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);
+
+    const short ncols = (short) min((int) nr1, args.ne1 - r1);
+
+    device const float * yb = (device const float *) (src1 + offset1) + 64*iq + 4*ir;
+
+    const int ys = (int) (args.nb11/sizeof(float));
+
+    int yc[nr1];
+
+    FOR_UNROLL (short c = 0; c < nr1; ++c) {
+        yc[c] = (c < ncols ? c : 0)*ys;
+    }
+
+    const uint64_t sr2 = args.nb01/2;
+    const uint64_t sr4 = args.nb01/4;
+
+    float sumf[nr0][nr1];
+
+    FOR_UNROLL (short row = 0; row < nr0; ++row) {
+        FOR_UNROLL (short c = 0; c < nr1; ++c) {
+            sumf[row][c] = 0.f;
+        }
+    }
+
+    float4 yg[nr1];
+
+    // the packed replacement for l16's float ds[nr0][4] / float dm[nr0][4]:
+    //   sq[row] - the four 6-bit sub-block scales, one per byte, sub-block SI in byte SI
+    //   mq[row] - the four 6-bit sub-block minimums, same layout
+    //   dd[row] - (d, dmin) of the super-block, unconverted
+    // 3 registers per row against 8, i.e. 12 against 32 at nr0 = 4.
+    uint  sq[nr0];
+    uint  mq[nr0];
+    half2 dd[nr0];
+
+    for (int ib = ix; ib < nb; ib += 2) {
+        {
+            device const uint16_t * sp = (device const uint16_t *)x[ib].scales + iq;
+            device const half     * dp = &x[ib].d;
+
+            FOR_UNROLL (short row = 0; row < nr0; ++row) {
+                const ushort s0 = sp[0];
+                const ushort s2 = sp[2];
+                const ushort s4 = sp[4];
+
+                const ushort sa = s0 & 0x3f3f;
+                const ushort sb = s2 & 0x3f3f;
+                const ushort sc = ((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2);
+                const ushort sd = ((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2);
+
+                // sa/sb hold sub-blocks 0,1 in their low,high byte; sc/sd hold 2,3
+                sq[row] = (uint) sa | ((uint) sc << 16);
+                mq[row] = (uint) sb | ((uint) sd << 16);
+
+                dd[row] = half2(dp[0], dp[1]);
+
+                sp += sr2;
+                dp += sr2;
+            }
+        }
+
+        device const uint * qb = (device const uint *)x[ib].qs + 8*iq + ir;
+
+        const int yi = ib*QK_K;
+
+        MV_L16P_Q4_K_SG(  0,  0, 0, 0)
+        MV_L16P_Q4_K_SG( 32,  0, 4, 1)
+        MV_L16P_Q4_K_SG(128, 16, 0, 2)
+        MV_L16P_Q4_K_SG(160, 16, 4, 3)
+    }
+
+    MV_NR1_STORE()
+}
+
+#define MUL_MV_NR1_L16P_KERNEL(NR0, NR1) \
+    [[host_name("kernel_mul_mv_q4_K_f32_r1_" #NR1 "_l16p_" #NR0)]] \
+    kernel void kernel_mul_mv_q4_K_f32_r1_##NR1##_l16p_##NR0( \
+            constant ggml_metal_kargs_mul_mv & args, \
+            device const char * src0, \
+            device const char * src1, \
+            device       char * dst, \
+            uint3  tgpig[[threadgroup_position_in_grid]], \
+            ushort tiisg[[thread_index_in_simdgroup]], \
+            ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+        kernel_mul_mv_q4_K_f32_nr1_l16p_impl<NR0, NR1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg); \
+    }
+
+// width 4 only. width 3 is instruction-bound and this variant loses 6.9 % there.
+MUL_MV_NR1_L16P_KERNEL(4, 4)
+
+// ---------------------------------------------------------------------------------------------
+// l16q - the SAME idea at the OTHER integral packing, built because the record disagrees with
+// itself about which one the lost original was.
+//
+// LEDGER 2's index says l16p was "packed scales, 32 -> 16 registers", and the board recovered in
+// `.notes/board-vs-repo-conflict.md` 3 calls it "packing sixteen registers". `.notes/matvec-anatomy.md`
+// says "-18". Those cannot both be the same kernel, and 18 is not reachable at all: the per-row
+// layout is integral, so the packing lands on 16 registers (dv and mv kept as per-row floats, only
+// the scale and min bytes packed - this kernel) or on 12 (d and dmin packed into a half2 as well -
+// l16p above). Priced on the same toolchain:
+//
+//            AIR   hoisted state   R at width 4   R at width 3
+//   l16      536   32 registers    94             86
+//   l16q     560   16              78             70
+//   l16p     565   12              74             66
+//   original 570   "16" / "-18"    ?              "68"
+//
+// So l16p is nearer the original's instruction count and l16q is nearer its stated register count,
+// and at width 4 - the only width either is instantiated at - BOTH sit in the same occupancy
+// bucket, which is the entire mechanism. Rather than guess, both are built and an env var picks:
+// the critic gets two arms out of one build instead of one arm and a rebuild.
+//
+// DEFAULT IS l16p. l16q is reachable with GGML_METAL_L16P_VARIANT=q.
+#define MV_L16Q_Q4_K_SG(YOFF, QI, SH, SI)                                        \
+    {                                                                            \
+        MV_NR1_LOAD_YG(YOFF)                                                     \
+                                                                                 \
+        device const uint * qp = qb + (QI);                                      \
+                                                                                 \
+        FOR_UNROLL (short row = 0; row < nr0; ++row) {                           \
+            const float4 f = unpack_unorm4x8_to_float((qp[0] >> (SH)) & 0x0F0F0F0F); \
+                                                                                 \
+            const float sv = dv[row]*(float)((sq[row] >> (8*(SI))) & 0xFFu);     \
+            const float mm = mv[row]*(float)((mq[row] >> (8*(SI))) & 0xFFu);     \
+                                                                                 \
+            const float4 w = sv*f - mm;                                          \
+                                                                                 \
+            FOR_UNROLL (short c = 0; c < nr1; ++c) {                             \
+                sumf[row][c] += dot(w, yg[c]);                                   \
+            }                                                                    \
+                                                                                 \
+            qp += sr4;                                                           \
+        }                                                                        \
+    }
+
+template<int nr0, int nr1, typename args_t>
+void kernel_mul_mv_q4_K_f32_nr1_l16q_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const short ix  = tiisg/16;
+    const short tid = tiisg%16;
+    const short iq  = tid/8;
+    const short ir  = tid%8;
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y*nr1;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);
+
+    const short ncols = (short) min((int) nr1, args.ne1 - r1);
+
+    device const float * yb = (device const float *) (src1 + offset1) + 64*iq + 4*ir;
+
+    const int ys = (int) (args.nb11/sizeof(float));
+
+    int yc[nr1];
+
+    FOR_UNROLL (short c = 0; c < nr1; ++c) {
+        yc[c] = (c < ncols ? c : 0)*ys;
+    }
+
+    const uint64_t sr2 = args.nb01/2;
+    const uint64_t sr4 = args.nb01/4;
+
+    float sumf[nr0][nr1];
+
+    FOR_UNROLL (short row = 0; row < nr0; ++row) {
+        FOR_UNROLL (short c = 0; c < nr1; ++c) {
+            sumf[row][c] = 0.f;
+        }
+    }
+
+    float4 yg[nr1];
+
+    // 4 registers per row against l16's 8: the scale and min bytes packed, dv and mv left as floats
+    uint  sq[nr0];
+    uint  mq[nr0];
+    float dv[nr0];
+    float mv[nr0];
+
+    for (int ib = ix; ib < nb; ib += 2) {
+        {
+            device const uint16_t * sp = (device const uint16_t *)x[ib].scales + iq;
+            device const half     * dp = &x[ib].d;
+
+            FOR_UNROLL (short row = 0; row < nr0; ++row) {
+                const ushort s0 = sp[0];
+                const ushort s2 = sp[2];
+                const ushort s4 = sp[4];
+
+                const ushort sa = s0 & 0x3f3f;
+                const ushort sb = s2 & 0x3f3f;
+                const ushort sc = ((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2);
+                const ushort sd = ((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2);
+
+                sq[row] = (uint) sa | ((uint) sc << 16);
+                mq[row] = (uint) sb | ((uint) sd << 16);
+
+                dv[row] = 255.f*(float) dp[0];
+                mv[row] =        (float) dp[1];
+
+                sp += sr2;
+                dp += sr2;
+            }
+        }
+
+        device const uint * qb = (device const uint *)x[ib].qs + 8*iq + ir;
+
+        const int yi = ib*QK_K;
+
+        MV_L16Q_Q4_K_SG(  0,  0, 0, 0)
+        MV_L16Q_Q4_K_SG( 32,  0, 4, 1)
+        MV_L16Q_Q4_K_SG(128, 16, 0, 2)
+        MV_L16Q_Q4_K_SG(160, 16, 4, 3)
+    }
+
+    MV_NR1_STORE()
+}
+
+#define MUL_MV_NR1_L16Q_KERNEL(NR0, NR1) \
+    [[host_name("kernel_mul_mv_q4_K_f32_r1_" #NR1 "_l16q_" #NR0)]] \
+    kernel void kernel_mul_mv_q4_K_f32_r1_##NR1##_l16q_##NR0( \
+            constant ggml_metal_kargs_mul_mv & args, \
+            device const char * src0, \
+            device const char * src1, \
+            device       char * dst, \
+            uint3  tgpig[[threadgroup_position_in_grid]], \
+            ushort tiisg[[thread_index_in_simdgroup]], \
+            ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+        kernel_mul_mv_q4_K_f32_nr1_l16q_impl<NR0, NR1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg); \
+    }
+
+MUL_MV_NR1_L16Q_KERNEL(4, 4)
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_q5_K_f32_impl(
         args_t args,

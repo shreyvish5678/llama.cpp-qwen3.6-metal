@@ -935,12 +935,41 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     // tolerance check and does not settle this on its own.
                     static const bool l16_off = getenv("GGML_METAL_NO_Q4_L16") != nullptr;
 
+                    // L1-l16p. WIDTH-AWARE SELECTION: one kernel used to serve both widths, and
+                    // that threw away a win, because width 3 and width 4 do not have the same
+                    // binding constraint. Width 3 is INSTRUCTION-bound and width 4 is
+                    // REGISTER-bound, so the same packing is worth 1.069 (a loss) at width 3 and
+                    // 0.919 (an 8 % win) at width 4. Hence: l16p at width 4, l16 at width 3.
+                    //
+                    // Those two ratios are the LOST ORIGINAL's measurements, recorded in LEDGER 2;
+                    // the kernel below is a reconstruction from its specification, matching it to
+                    // 0.9 % on AIR instruction count (565 against 570) but not yet measured
+                    // itself. And the register step it is supposed to buy is PREDICTED, not
+                    // measured: no register count is obtainable on this machine at all - see the
+                    // long comment on the kernel and .notes/metal-toolchain.md. What is measured
+                    // here is the source-level live set, 32 registers of hoisted scales down to
+                    // 12. Whether that crosses an occupancy boundary is what the A/B decides.
+                    static const bool l16p_off = getenv("GGML_METAL_NO_L16P") != nullptr;
+
+                    // Which packing. The record disagrees with itself about what the lost original
+                    // packed - LEDGER 2 and the recovered board say "16 registers", the anatomy
+                    // note says "-18", and 18 is not reachable with an integral per-row layout. So
+                    // both integral points are built: l16p keeps 12 registers, l16q keeps 16, and
+                    // at width 4 they sit in the same occupancy bucket. GGML_METAL_L16P_VARIANT=q
+                    // takes the second. Default is l16p, whose 565 AIR instructions are nearer the
+                    // original's recorded 570 than l16q's 560.
+                    static const char * l16p_var = getenv("GGML_METAL_L16P_VARIANT");
+                    static const bool l16q_on = l16p_var && l16p_var[0] == 'q';
+
                     const bool l16 = nr1k >= 3 && ne01 >= 4096 && !l16_off;
 
                     nr0 = l16 ? 4 : N_R0_Q4_K_R1;
                     nr1 = nr1k;
                     if (l16) {
-                        suffix = nr1k == 3 ? "_r1_3_l16_4" : "_r1_4_l16_4";
+                        suffix = nr1k == 3 ? "_r1_3_l16_4"
+                               : l16p_off  ? "_r1_4_l16_4"
+                               : l16q_on   ? "_r1_4_l16q_4"
+                                           : "_r1_4_l16p_4";
                     } else {
                         suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
                     }
