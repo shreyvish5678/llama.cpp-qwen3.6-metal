@@ -814,13 +814,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 // number of src1 columns that one threadgroup of the multi-column K-quant mat-vec kernels handles.
 // the kernels are instantiated for nr1 = 2, 3, 4; anything else falls back to the nr1 == 1 kernel.
 // for ne11 that is not covered exactly, pick the divisor that wastes the fewest column slots.
+// L4-widenr1. The comment on cases 5 and 6 below counted the wasted COLUMN SLOT and not the
+// wasted BANDWIDTH. The grid is ceil(ne11/nr1) threadgroups in the column direction and each one
+// reads its own copy of the weight rows it covers, so ne11 = 5 at nr1 = 3 issues TWO passes over
+// the entire weight matrix to produce five columns, where ne11 = 4 at nr1 = 4 issues one.
+//
+// That makes draft depth 4 the worst setting available and depth 5 nearly as bad -- measured, not
+// derived: 26.820 and 28.901 tok/s against 30.059 at depth 3, on a grid where token yield rises
+// the whole way. Depth 5 pays a full extra 16.08 GB pass and still comes within 3.9 %.
+//
+// Widths 5 and 6 are now instantiated. Default OFF so the shipped path does not move;
+// GGML_METAL_WIDE_NR1=1 arms it. This is UPSTREAM.md 9's proposed fix, built.
 static int ggml_metal_mul_mv_nr1_k(int ne11) {
+    static const bool wide = getenv("GGML_METAL_WIDE_NR1") != nullptr;
     switch (ne11) {
         case 2:  return 2;
         case 3:  return 3;
         case 4:  return 4;
-        case 5:  return 3; // 2 threadgroups, 1 slot wasted
-        case 6:  return 3; // 2 threadgroups, exact
+        case 5:  return wide ? 5 : 3; // unarmed: 2 threadgroups, and a second pass over the weights
+        case 6:  return wide ? 6 : 3; // unarmed: 2 threadgroups, exact in slots, still two passes
         case 7:  return 4; // 2 threadgroups, 1 slot wasted
         case 8:  return 4; // 2 threadgroups, exact
         default: return 1;
@@ -970,17 +982,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     static const char * l16p_var = getenv("GGML_METAL_L16P_VARIANT");
                     static const bool l16q_on = l16p_var && l16p_var[0] == 'q';
 
-                    const bool l16 = nr1k >= 3 && ne01 >= 4096 && !l16_off;
+                    // L4-widenr1. l16 is nr0 = 4 and it is at a register ceiling: at nr1 = 5 it
+                    // measures 1.93x SLOWER even though it reads HALF the weight bytes (one pass
+                    // instead of two). The plain nr0 = 2 kernel takes the same width at 0.9067,
+                    // i.e. 9.3 % faster, ranges disjoint. So l16 keeps exactly the widths it was
+                    // measured to win at and the wider ones fall through to the plain kernel.
+                    const bool l16 = (nr1k == 3 || nr1k == 4) && ne01 >= 4096 && !l16_off;
 
                     nr0 = l16 ? 4 : N_R0_Q4_K_R1;
                     nr1 = nr1k;
                     if (l16) {
                         suffix = nr1k == 3 ? "_r1_3_l16_4"
+                               : nr1k == 5 ? "_r1_5_l16_4"     // L4-widenr1
+                               : nr1k == 6 ? "_r1_6_l16_4"     // L4-widenr1
                                : l16p_off  ? "_r1_4_l16_4"
                                : l16q_on   ? "_r1_4_l16q_4"
                                            : "_r1_4_l16p_4";
                     } else {
-                        suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                        suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3"
+                               : nr1k == 5 ? "_r1_5" : nr1k == 6 ? "_r1_6"   // L4-widenr1
+                                           : "_r1_4";
                     }
                 }
             } break;
@@ -993,7 +1014,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 if (nr1k > 1) {
                     nr0    = N_R0_Q5_K_R1;
                     nr1    = nr1k;
-                    suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                    suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3"
+                           : nr1k == 5 ? "_r1_5" : nr1k == 6 ? "_r1_6"   // L4-widenr1
+                                       : "_r1_4";
                 }
             } break;
         case GGML_TYPE_Q6_K:
@@ -1015,14 +1038,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     // read once: this runs for every Q6_K MUL_MAT on every graph encode
                     static const bool off = getenv("GGML_METAL_NO_Q6_NR0") != nullptr;
 
-                    const bool wide = nr1k >= 3 && ne01 >= N_R0_Q6_K_R1_WIDE_MIN_NE01 && !off;
+                    // L4-widenr1: nr0 = 4 only at the widths it was measured at. See q4_K above.
+                    const bool wide = (nr1k == 3 || nr1k == 4) && ne01 >= N_R0_Q6_K_R1_WIDE_MIN_NE01 && !off;
 
                     nr0    = wide ? N_R0_Q6_K_R1_WIDE : N_R0_Q6_K_R1;
                     nr1    = nr1k;
                     if (wide) {
-                        suffix = nr1k == 3 ? "_r1_3_r0_4" : "_r1_4_r0_4";
+                        suffix = nr1k == 3 ? "_r1_3_r0_4"
+                               : nr1k == 5 ? "_r1_5_r0_4"   // L4-widenr1
+                               : nr1k == 6 ? "_r1_6_r0_4"   // L4-widenr1
+                                           : "_r1_4_r0_4";
                     } else {
-                        suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                        suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3"
+                           : nr1k == 5 ? "_r1_5" : nr1k == 6 ? "_r1_6"   // L4-widenr1
+                                       : "_r1_4";
                     }
                     static_assert(N_R0_Q6_K_R1_WIDE == 4, "the _r0_4 suffixes above are literal");
                 }

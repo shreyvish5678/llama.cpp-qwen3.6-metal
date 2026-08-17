@@ -8686,6 +8686,29 @@ MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 2)
 MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 3)
 MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 4)
 
+// L4-widenr1. ggml_metal_mul_mv_nr1_k() maps a verify width to columns-per-threadgroup, and it is
+// instantiated only for 2, 3 and 4. Width 5 falls back to 3 and width 6 falls back to 3, so the
+// dispatch grid -- ceil(ne11/nr1) threadgroups, each reading its OWN copy of the weight rows --
+// issues TWO passes over the whole 16.08 GB weight set to produce 5 or 6 columns.
+//
+// The measured operating-point grid says how much that costs, and it is the reason to build this:
+//
+//   depth  width  nr1k  passes   tok/s (p_min 0.6)
+//     2      3      3      1     29.552
+//     3      4      4      1     30.059   <- shipped
+//     4      5      3      2     26.820
+//     5      6      3      2     28.901
+//
+// Depth 5 pays an entire extra pass over the single most expensive item in the decode cycle and
+// still lands within 3.9 % of the shipped point. Its token yield is 3.859 per forward against
+// 3.118. Neither depth 4 nor depth 5 has EVER been measured at one pass, so the grid that closed
+// "depth stays at 3" was a measurement of this bug and not of drafting.
+//
+// Instantiating 5 and 6 is what UPSTREAM.md 9 proposes and nobody had built. Default OFF;
+// GGML_METAL_WIDE_NR1=1 arms it, so the shipped path is bit-for-bit the shipped path.
+MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 5)
+MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 6)
+
 // A8-lanes16: the q4_K multi-column mat-vec with SIXTEEN lanes on a super-block instead of eight.
 //
 // This is the last structural difference between the q4_K and q6_K multi-column kernels that has
@@ -8848,6 +8871,9 @@ void kernel_mul_mv_q4_K_f32_nr1_l16_impl(
 MUL_MV_NR1_L16_KERNEL(4, 2)
 MUL_MV_NR1_L16_KERNEL(4, 3)
 MUL_MV_NR1_L16_KERNEL(4, 4)
+// L4-widenr1: the 16-lane mapping at the widths the bug hid
+MUL_MV_NR1_L16_KERNEL(4, 5)
+MUL_MV_NR1_L16_KERNEL(4, 6)
 
 // ---------------------------------------------------------------------------------------------
 // L1-l16p - `l16` with the hoisted per-row scales PACKED.
@@ -9509,6 +9535,9 @@ void kernel_mul_mv_q5_K_f32_nr1_impl(
 MUL_MV_NR1_KERNEL(q5_K, N_R0_Q5_K_R1, 2)
 MUL_MV_NR1_KERNEL(q5_K, N_R0_Q5_K_R1, 3)
 MUL_MV_NR1_KERNEL(q5_K, N_R0_Q5_K_R1, 4)
+// L4-widenr1
+MUL_MV_NR1_KERNEL(q5_K, N_R0_Q5_K_R1, 5)
+MUL_MV_NR1_KERNEL(q5_K, N_R0_Q5_K_R1, 6)
 
 template<int nr0, typename args_t>
 void kernel_mul_mv_q6_K_f32_impl(
@@ -9738,6 +9767,9 @@ void kernel_mul_mv_q6_K_f32_nr1_impl(
 MUL_MV_NR1_KERNEL(q6_K, N_R0_Q6_K_R1, 2)
 MUL_MV_NR1_KERNEL(q6_K, N_R0_Q6_K_R1, 3)
 MUL_MV_NR1_KERNEL(q6_K, N_R0_Q6_K_R1, 4)
+// L4-widenr1
+MUL_MV_NR1_KERNEL(q6_K, N_R0_Q6_K_R1, 5)
+MUL_MV_NR1_KERNEL(q6_K, N_R0_Q6_K_R1, 6)
 
 // A5-q6nr0: nr0 = 4 instantiations of the Q6_K multi-column mat-vec, selected at dispatch for
 // verify widths of 3 and 4 on large matrices. The multi-column kernels are bound by activation
@@ -9766,6 +9798,11 @@ MUL_MV_NR1_KERNEL(q6_K, N_R0_Q6_K_R1, 4)
 
 MUL_MV_NR1_KERNEL_R0_X(q6_K, N_R0_Q6_K_R1_WIDE, 3)
 MUL_MV_NR1_KERNEL_R0_X(q6_K, N_R0_Q6_K_R1_WIDE, 4)
+// L4-widenr1. Without these two the wide branch below selects `_r1_4_r0_4` for nr1k = 5 and 6
+// while setting nr1 = 5 or 6 -- a kernel compiled for four columns, dispatched to produce five.
+// It fails test-backend-ops at ERR 0.244, which is how it was found.
+MUL_MV_NR1_KERNEL_R0_X(q6_K, N_R0_Q6_K_R1_WIDE, 5)
+MUL_MV_NR1_KERNEL_R0_X(q6_K, N_R0_Q6_K_R1_WIDE, 6)
 
 // ======================= "True" 2-bit
 
