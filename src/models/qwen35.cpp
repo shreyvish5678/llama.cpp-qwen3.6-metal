@@ -41,24 +41,14 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
 
-    int64_t n_vocab_out = n_vocab;
-    const ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t");
-    if (mtp_only && d2t_meta) {
-        n_vocab_out = d2t_meta->ne[0];
-        d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_vocab_out }, 0);
-        LLAMA_LOG_INFO("%s: QWEN35 MTP using d2t draft-vocab trim (n_vocab_out = %lld)\n",
-                __func__, (long long) n_vocab_out);
-    }
-
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_out }, TENSOR_NOT_REQUIRED);
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
-        GGML_ASSERT(!d2t && "d2t draft-vocab trim requires output.weight");
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -648,27 +638,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
 
-    // Two ways the DRAFT head can carry a trimmed vocabulary, and they must never both fire.
-    // model.d2t is a trim baked into the GGUF - a FastMTP sidecar ships output.weight already
-    // cut to the draft vocabulary. mtp_head_trim is one this build cut at load time from the
-    // full head (LLAMA_MTP_VOCAB_N). Either way this graph is only ever built for
+    // FR-Spec: when a frequency-ranked draft vocabulary was built (LLAMA_MTP_VOCAB_N), the
+    // DRAFT head is a row subset of the full head. This graph is only ever built for
     // LLM_GRAPH_TYPE_DECODER_MTP, so the target model's own LM head is untouched and still
     // verifies over the full vocabulary - which is what makes the trim lossless.
-    ggml_tensor * d2t = nullptr;
-
-    if (model.d2t) {
-        // head_w already IS the trimmed head, straight out of the file.
-        GGML_ASSERT(!model.mtp_head_trim &&
-                "QWEN35 MTP: the GGUF already carries a trimmed draft vocab - unset LLAMA_MTP_VOCAB_N");
-        d2t = model.d2t;
-    } else if (model.mtp_head_trim) {
+    const bool trim_vocab = model.mtp_head_trim != nullptr;
+    if (trim_vocab) {
         head_w = model.mtp_head_trim;
-        d2t    = model.mtp_d2t;
     }
 
     cur = build_lora_mm(head_w, cur, head_s);
 
-    if (d2t) {
+    if (trim_vocab) {
         // scatter the compressed logits back into full-vocab positions, -inf elsewhere, so
         // that every consumer downstream (draft sampler, token ids handed to the target)
         // only ever sees full-vocab-shaped, correctly-indexed logits. same construction as
@@ -677,16 +658,15 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         const int64_t n_out         = cur->ne[1];
         const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
 
-        // a GGUF-supplied d2t is I32, one we built is I64. ggml_set_rows takes either.
-        GGML_ASSERT(d2t->type == GGML_TYPE_I64 || d2t->type == GGML_TYPE_I32);
-        GGML_ASSERT(d2t->ne[0] == n_draft_vocab);
+        GGML_ASSERT(model.mtp_d2t->type == GGML_TYPE_I64);
+        GGML_ASSERT(model.mtp_d2t->ne[0] == n_draft_vocab);
 
         ggml_tensor * logits = ggml_fill(ctx0,
                 ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_out), -INFINITY);
 
         cur = ggml_set_rows(ctx0, logits,
-                ggml_reshape_3d(ctx0, cur, 1,             n_draft_vocab, n_out),
-                ggml_reshape_3d(ctx0, d2t, n_draft_vocab, 1,             1));
+                ggml_reshape_3d(ctx0, cur,           1,             n_draft_vocab, n_out),
+                ggml_reshape_3d(ctx0, model.mtp_d2t, n_draft_vocab, 1,             1));
 
         cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_out);
     }
